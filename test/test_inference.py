@@ -14,24 +14,24 @@ class TestQwen2Inference(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Gather all Qwen model IDs that we intend to test."""
-        # cls.forbidden_endings = ["Int4", "Int8", "AWQ", "GGUF", "MLX"]
-        # cls.forbidden_keywords = ["Audio", "72B"]
-        # all_models = list_models(author="Qwen")
+        cls.forbidden_endings = ["Int4", "Int8", "AWQ", "GGUF", "MLX"]
+        cls.forbidden_keywords = ["Audio", "72B"]
+        all_models = list_models(author="Qwen")
 
-        # cls.model_ids = []
-        # for model_info in all_models:
-        #     model_id = model_info.modelId
-        #     if (
-        #         model_id.startswith("Qwen/Qwen2")
-        #         and not any(model_id.endswith(end) for end in cls.forbidden_endings)
-        #         and not any(keyword in model_id for keyword in cls.forbidden_keywords)
-        #     ):
-        #         cls.model_ids.append(model_id)
-        cls.model_ids = [
-            "Qwen/Qwen2-VL-2B-Instruct",  # VL model
-            "Qwen/Qwen2.5-3B",            # Text-only model
-        ]
-        cls.device = "cuda" if torch.cuda.is_available() else "cpu"
+        cls.model_ids = []
+        for model_info in all_models:
+            model_id = model_info.modelId
+            if (
+                model_id.startswith("Qwen/Qwen2")
+                and not any(model_id.endswith(end) for end in cls.forbidden_endings)
+                and not any(keyword in model_id for keyword in cls.forbidden_keywords)
+            ):
+                cls.model_ids.append(model_id)
+        # cls.model_ids = [
+        #     "Qwen/Qwen2-VL-2B-Instruct",  # VL model
+        #     "Qwen/Qwen2.5-3B",            # Text-only model
+        # ]
+        # cls.device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 
