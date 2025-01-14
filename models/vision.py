@@ -2,7 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from config import VisionConfig
+from models.config import VisionConfig
 
 
 class VisionRotaryEmbedding(nn.Module):

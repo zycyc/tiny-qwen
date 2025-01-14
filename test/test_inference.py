@@ -23,8 +23,13 @@ class TestQwen2Inference(unittest.TestCase):
                 and not any(keyword in model_id for keyword in cls.forbidden_keywords)
             ):
                 cls.model_ids.append(model_id)
-
+        # cls.model_ids = [
+        #     "Qwen/Qwen2-VL-2B-Instruct",  # VL model
+        #     "Qwen/Qwen2.5-3B",            # Text-only model
+        # ]
         cls.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+
 
     def test_inference_on_qwen2_variants(self):
         """
@@ -32,7 +37,8 @@ class TestQwen2Inference(unittest.TestCase):
         - Use Qwen2 for all non-VL models with a simple text prompt
         - Use Qwen2VL with a text+image prompt
         """
-        for model_name in self.model_ids:
+        total_models = len(self.model_ids)
+        for idx, model_name in enumerate(self.model_ids, 1):
             with self.subTest(model_name=model_name):
                 # Decide whether to load Qwen2 or Qwen2VL
                 if "VL" in model_name:
@@ -46,7 +52,7 @@ class TestQwen2Inference(unittest.TestCase):
                     model_cls = Qwen2
                     test_prompt = ["what is the meaning of life?"]
 
-                print(f"\n[TEST] Loading: {model_name}")
+                print(f"\n[TEST] [{idx}/{total_models}] Loading: {model_name}")
                 model = model_cls.from_pretrained(model_name).to(self.device)
                 model.eval()
 
