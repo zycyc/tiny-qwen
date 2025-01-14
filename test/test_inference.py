@@ -88,6 +88,13 @@ class TestQwen2Inference(unittest.TestCase):
                 # Basic check: ensure we got something back
                 self.assertTrue(len(decoded) > 0, f"Decoded text is empty for model {model_name}")
 
+                # Clean up GPU memory
+                del model
+                del inputs
+                del output
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
 
 if __name__ == "__main__":
     unittest.main()
