@@ -31,7 +31,7 @@ class TestQwen2Inference(unittest.TestCase):
         #     "Qwen/Qwen2-VL-2B-Instruct",  # VL model
         #     "Qwen/Qwen2.5-3B",            # Text-only model
         # ]
-        # cls.device = "cuda" if torch.cuda.is_available() else "cpu"
+        cls.device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 
