@@ -2,9 +2,9 @@
 
 A minimal, easy-to-read PyTorch reimplementation of the Qwen2 and Qwen2.5, the open source multi-modal LLM. 
 
-We support both text-only (Instruct, Coder, Math, etc.) and text+vision versions. Just choose a repo id from Hugging Face [here](https://huggingface.co/Qwen). 
+We support both text-only (Instruct, Coder, Math, etc.) and text+vision, and any full prevision Qwen2+ model at any size. Just choose a repo id from Hugging Face [here](https://huggingface.co/Qwen). 
 
-Any full precision `Qwen2`, `Qwen2.5`, `Qwen2-VL`, or `Qwen2.5-VL` is supported. Keep in mind you'll likely need multiple GPU for models bigger than 32B. Stay tuned for FSDP support in the coming days. If you run into any issues, open a PR or create an issue.
+Keep in mind you'll likely need multiple GPU for models bigger than 32B. Stay tuned for FSDP support in the coming days. If you run into any issues, open a PR or create an issue.
 
 # 🦋 Quick Start
 
