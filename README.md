@@ -1,78 +1,44 @@
+# ✨ Tiny Qwen
+
+A minimal, easy-to-read PyTorch reimplementation of the Qwen2 and Qwen2.5, the open source multi-modal LLM, supporting both text and vision. 
+
+We support both text-only (Instruct, Coder, Math, etc.) and text+vision versions. Choose a repo id from Hugging Face [here](https://huggingface.co/Qwen). 
+
+Any full precision `Qwen2`, `Qwen2.5`, `Qwen2-VL`, or `Qwen2.5-VL` is supported. Keep in mind you'll likely need multiple GPU for models bigger than 32B. Stay tuned for FSDP support in the coming days. If you run into any issues, open a PR or create an issue.
 
 # 🦋 Quick Start
 
-For text-only Qwen2 models
-
 ```python
-from models.model import Qwen2
+from models.model import Qwen2, Qwen2VL
 from models.processor import MultimodalProcessor
 
-model_name = "Qwen/Qwen2.5-3B"
-
-model = Qwen2.from_pretrained(repo_id=model_name)
 processor = MultimodalProcessor(tokenizer_name_or_path=model_name)
 
-context = ["<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nhello :)<|im_end|>\n<|im_start|>assistant\n"]
+# text-only models
+model = Qwen2.from_pretrained(repo_id="Qwen/Qwen2.5-3B")
 
+context = ["<|im_start|>user\nhello:)<|im_end|>\n<|im_start|>assistant\n"]
 inputs = processor(context, device="cuda")
 output = model.generate(input_ids=inputs["input_ids"], max_new_tokens=64)
+output_text = processor.tokenizer.decode(output[0].tolist())
 
-text = processor.tokenizer.decode(output[0].tolist())
-print(text)
-```
+# text + vision models
+model = Qwen2VL.from_pretrained(repo_id="Qwen/Qwen2-VL-2B-Instruct")
 
-For text + vision Qwen2 models
-
-```python
-from models.model import Qwen2VL
-from models.processor import MultimodalProcessor
-
-model_name = "Qwen/Qwen2-VL-2B-Instruct"
-
-model = Qwen2VL.from_pretrained(repo_id=model_name)
-processor = MultimodalProcessor(tokenizer_name_or_path=model_name)
-
-# Arrange context in a list of strings and images
-context_1 = [
-    "<|im_start|>user\n<|vision_start|>",
-    Image.open("test-images/test-image.jpeg"),
-    "<|vision_end|>What's on the flower and what does it say about the meaning of life?<|im_end|>\n<|im_start|>assistant\n",
+context = [
+    "<|im_start|>user\n<|vision_start|>", 
+    Image.open("test-images/test-image.jpeg"), 
+    "<|vision_end|>What's on this image?<|im_end|>\n<|im_start|>assistant\n"
 ]
-
-# You can also use multiple images
-context_2 = [
-    "<|im_start|>user\nhere is an image\n<|vision_start|>",
-    Image.open("test-images/test-image.jpeg"),
-    "<|vision_end|>\nhere is another image\n<|vision_start|>",
-    Image.open("test-images/test-image.jpeg"),
-    "<|vision_end|>\nare these 2 images the same?<|im_end|>\n<|im_start|>assistant\n",
-]
-
-inputs = processor(context_1, device="cuda")
+inputs = processor(context, device="cuda")
 output = model.generate(
     input_ids=inputs["input_ids"],
     pixels=inputs["pixels"],
     d_image=inputs["d_image"],
     max_new_tokens=64,
 )
-
-text = processor.tokenizer.decode(output[0].tolist())
-print(text)
+output_text = processor.tokenizer.decode(output[0].tolist())
 ```
-
-# 🍀 Choose ANY Qwen2 / Qwen2-VL models
-
-We support both text-only (Instruct, Coder, Math, etc.) and text+vision versions. Just pick its Hugging Face repo ID:
-
-| Model Variant        | Sample Sizes                 | Text + Vision? | Example Repo ID                  |
-| -------------------- | ---------------------------- | -------------: | -------------------------------- |
-| **Qwen2.5-Instruct** | 0.5B, 1.5B, 3B, 7B, 14B, 32B |              ❌ | `Qwen/Qwen2.5-7B-Instruct`       |
-| **Qwen2.5-Coder**    | 0.5B, 1.5B, 3B, 7B...        |              ❌ | `Qwen/Qwen2.5-Coder-7B-Instruct` |
-| **Qwen2.5-Math**     | 1.5B, 7B, 72B                |              ❌ | `Qwen/Qwen2.5-Math-7B-Instruct`  |
-| **Qwen2-Instruct**   | 0.5B, 7B, 14B, 32B           |              ❌ | `Qwen/Qwen2-7B-Instruct`         |
-| **Qwen2-VL**         | 2B, 7B, 72B                  |              ✅ | `Qwen/Qwen2-VL-2B-Instruct`      |
-
-I’ve tested up to **32B** (single GPU, full precision). Stay tuned for FSDP support in the coming days. If you run into any issues, open a PR or create an issue.
 
 # 🛠️ Fine-tune / Post-train Your Own
 
