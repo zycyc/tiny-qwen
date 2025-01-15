@@ -42,9 +42,9 @@ output_text = processor.tokenizer.decode(output[0].tolist())
 
 # 🛠️ Fine-tune / Post-train Your Own
 
-See `train/train_sft.py` for simple example on how to fine-tune your own Qwen model. Any library compatible with `torch.nn.Module` wourld work. Here I used [PyTorch Lightning](https://lightning.ai/docs/pytorch/stable/index.html) for its flexibility and simplcity. Also see `train/train_mnist.py` for inspiration on how to use this library.
+See `train/train_sft.py` for simple SFT example. Any library compatible with `torch.nn.Module` wourld work, but here I used [PyTorch Lightning](https://lightning.ai/docs/pytorch/stable/index.html) for its flexibility and simplcity. Also see `train/train_mnist.py` for inspiration on how to use this library.
 
-To run any of the training scripts, just do:
+To run any of the training scripts, just run:
 
 ```bash
 PYTHONPATH=. python train/train_mnist.py
