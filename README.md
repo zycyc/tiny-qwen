@@ -1,8 +1,8 @@
 # ✨ Tiny Qwen
 
-A minimal, easy-to-read PyTorch reimplementation of the Qwen2 and Qwen2.5, the open source multi-modal LLM. 
+A minimal, easy-to-read PyTorch re-implementation of the Qwen2 and Qwen2.5, the open source multi-modal LLM.
 
-We support both text-only (Instruct, Coder, Math, etc.) and text+vision, and any full prevision Qwen2+ model at any size. Just choose a repo id from Hugging Face [here](https://huggingface.co/Qwen). 
+If you find Hugging Face Transformers' Qwen code too verbose and challenging to interprete, this repo is for you! Inspired by [nanoGPT](https://github.com/karpathy/nanoGPT) and [litGPT](https://github.com/Lightning-AI/litgpt), we support both text-only (Instruct, Coder, Math, etc.) and text+vision, and any full prevision Qwen2+ model at any size. Just choose a repo id from Hugging Face [here](https://huggingface.co/Qwen). 
 
 Keep in mind you'll likely need multiple GPU for models bigger than 32B. Stay tuned for FSDP support in the coming days. If you run into any issues, open a PR or create an issue.
 
