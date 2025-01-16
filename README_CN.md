@@ -4,9 +4,11 @@
 
 一个简洁易读的 PyTorch 代码库，用于重新实现 Qwen2 和 Qwen2.5（开源多模态大模型）。
 
-如果你觉得 [Transformers](https://github.com/huggingface/transformers) 代码太庞大难读，那么这个仓库可能更适合你！灵感来源于 [nanoGPT](https://github.com/karpathy/nanoGPT) 和 [litGPT](https://github.com/Lightning-AI/litgpt)，同时支持纯文本模型（如 Instruct、Coder、Math 等）以及文本 + 图像（VL）。还支持任何全精度的 Qwen2+ 模型，尺寸不限。只需从 [Hugging Face](https://huggingface.co/Qwen) 选择一个 repo id 即可。
+如果你觉得 [Transformers](https://github.com/huggingface/transformers) 代码太庞大难读，那么这个仓库可能更适合你！灵感来源于 [nanoGPT](https://github.com/karpathy/nanoGPT) 和 [litGPT](https://github.com/Lightning-AI/litgpt)，可同时支持纯文本模型（如 Instruct、Coder、Math 等）以及文本 + 图像（VL）。还支持任何全精度的 Qwen2+ 模型，尺寸不限。只需从 [Hugging Face](https://huggingface.co/Qwen) 选择一个 repo id 即可。
 
 注意：大于 32B 的模型通常需要多块 GPU。我们会在今后加入 FSDP 支持。如果遇到问题，请随时提 Issue 或提交 PR。
+
+此外，我在寻找志同道合的人合伙一起构建视觉 AI Agent。如果你对此感兴趣，请随时联系我~ (我的主页在 [这里](https://github.com/Emericen))
 
 ---
 
@@ -76,11 +78,4 @@ PYTHONPATH=. python train/train_mnist.py
 
 ```bash
 PYTHONPATH=. python train/train_sft.py
-```
-
----
-
-#### 想一起构建视觉 AI Agent？
-我非常热衷于“自动化电脑操作、解放人类劳动力”，期待和志同道合的人合作。如果这些代码让你感到兴奋或者你对这个方向有兴趣，请一定要发邮件联系我！（我的邮箱在我的 GitHub 主页中。）
-
 ```
