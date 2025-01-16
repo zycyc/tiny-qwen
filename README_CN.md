@@ -1,4 +1,4 @@
-[English](README.md) | [中文](README_zh.md)
+[English](README.md) | [中文](README_CN.md)
 
 # ✨ Tiny Qwen
 
@@ -8,7 +8,7 @@
 
 注意：大于 32B 的模型通常需要多块 GPU。我们会在今后加入 FSDP 支持。如果遇到问题，请随时提 Issue 或提交 PR。
 
-此外，我在寻找志同道合的人合伙一起构建视觉 AI Agent。如果你对此感兴趣，请随时联系我~ (我的主页在 [这里](https://github.com/Emericen))
+此外，我在找志同道合的人合伙一起构建视觉 AI Agent。如果你对此感兴趣，请随时联系我~ (我的主页在 [这里](https://github.com/Emericen))
 
 ---
 
