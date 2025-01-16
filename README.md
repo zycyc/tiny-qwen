@@ -6,29 +6,49 @@ If you find [Transformers](https://github.com/huggingface/transformers) code ver
 
 Keep in mind you'll likely need multiple GPU for models bigger than 32B. Stay tuned for FSDP support in the coming days. If you run into any issues, open a PR or create an issue.
 
+#### **Interested in building vision-based AI Agents?**
+
+I’m passionate about automating computer use to free up human labor and would love to collaborate with like-minded people. If this sound like you, please don't hesitate to reach out to me ([My Bio](https://github.com/Emericen))!
+
 # 🦋 Quick Start
+
+I recommend installing torch with cuda enabled (see [here](https://pytorch.org/get-started/locally/)). After that, simply run:
+
+```bash
+pip install -r requirements.txt
+```
+
+You can use the code base like the following:
 
 ```python
 from models.model import Qwen2, Qwen2VL
-from models.processor import MultimodalProcessor
-
-processor = MultimodalProcessor(tokenizer_name_or_path=model_name)
+from models.processor import Processor
+from PIL import Image
 
 # text-only models
-model = Qwen2.from_pretrained(repo_id="Qwen/Qwen2.5-3B")
+model_name = "Qwen/Qwen2.5-3B"
+model = Qwen2.from_pretrained(repo_id=model_name, device="cuda")
+processor = Processor(repo_id=model_name)
 
-context = ["<|im_start|>user\nhello:)<|im_end|>\n<|im_start|>assistant\n"]
+context = [
+    "<|im_start|>user\nwhat is the meaning of life?<|im_end|>\n<|im_start|>assistant\n"
+]
 inputs = processor(context, device="cuda")
 output = model.generate(input_ids=inputs["input_ids"], max_new_tokens=64)
 output_text = processor.tokenizer.decode(output[0].tolist())
 
 # text + vision models
-model = Qwen2VL.from_pretrained(repo_id="Qwen/Qwen2-VL-2B-Instruct")
+model_name = "Qwen/Qwen2-VL-2B-Instruct"
+model = Qwen2VL.from_pretrained(repo_id=model_name, device="cuda")
+processor = Processor(
+    repo_id=model_name,
+    vision_config=model.config.vision_config,
+)
 
 context = [
-    "<|im_start|>user\n<|vision_start|>", 
-    Image.open("test-images/test-image.jpeg"), 
-    "<|vision_end|>What's on this image?<|im_end|>\n<|im_start|>assistant\n"
+    "<|im_start|>user\n<|vision_start|>",
+    Image.open("images/test-image.jpeg"),
+    "<|vision_end|>What's on this image?<|im_end|>\n<|im_start|>assistant\n",
 ]
 inputs = processor(context, device="cuda")
 output = model.generate(

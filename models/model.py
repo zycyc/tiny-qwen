@@ -7,7 +7,7 @@ from typing import Optional
 from models.config import ModelConfig
 from models.mixin import ModelHubMixin
 from models.vision import Qwen2VLVisionEncoder
-from models.processor import MultimodalProcessor
+from models.processor import Processor
 
 from PIL import Image
 
@@ -324,8 +324,8 @@ if __name__ == "__main__":
     # text + vision model(s)
     model_name = "Qwen/Qwen2-VL-2B-Instruct"
     model = Qwen2VL.from_pretrained(model_name).to("cuda")
-    processor = MultimodalProcessor(
-        tokenizer_name_or_path=model_name,
+    processor = Processor(
+        repo_id=model_name,
         vision_config=model.config.vision_config,
     )
 

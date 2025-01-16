@@ -75,19 +75,20 @@ class ModelHubMixin:
     @classmethod
     def from_pretrained(
         cls,
-        pretrained_model_name_or_path: Union[str, Path],
+        repo_id: Union[str, Path],
+        device: Optional[str] = None,
         cache_dir: Optional[str] = None,
         local_files_only: bool = False,
         force_download: bool = False,
         **kwargs,
     ):
         # Determine model path
-        if os.path.isdir(pretrained_model_name_or_path):
-            model_path = Path(pretrained_model_name_or_path)
+        if os.path.isdir(repo_id):
+            model_path = Path(repo_id)
         else:
             model_path = Path(
                 snapshot_download(
-                    repo_id=pretrained_model_name_or_path,
+                    repo_id=repo_id,
                     cache_dir=cache_dir,
                     local_files_only=local_files_only,
                     force_download=force_download,
@@ -121,7 +122,8 @@ class ModelHubMixin:
                     if key in state_dict:
                         tensor = f.get_tensor(key)
                         state_dict[key].copy_(tensor)
-
+        if device:
+            model = model.to(device)
         return model
 
     def save_pretrained(

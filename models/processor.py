@@ -6,9 +6,9 @@ from models.config import VisionConfig
 from tokenizers import Tokenizer
 
 
-class MultimodalProcessor:
-    def __init__(self, tokenizer_name_or_path: str, vision_config: Optional[VisionConfig] = None):
-        self.tokenizer = Tokenizer.from_pretrained(tokenizer_name_or_path)
+class Processor:
+    def __init__(self, repo_id: str, vision_config: Optional[VisionConfig] = None):
+        self.tokenizer = Tokenizer.from_pretrained(repo_id)
         self.vision_config = vision_config
 
         if self.vision_config is not None:
@@ -197,8 +197,8 @@ if __name__ == "__main__":
         spatial_patch_size=14,
         temporal_patch_size=2,
     )
-    our_processor = MultimodalProcessor(
-        tokenizer_name_or_path=model_name, vision_config=vision_config
+    our_processor = Processor(
+        repo_id=model_name, vision_config=vision_config
     )
 
     image_1 = Image.open("test-images/test-image.webp")
