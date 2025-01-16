@@ -1,3 +1,7 @@
+<p align="left">
+    &nbspEnglish&nbsp | <a href="README_CN.md">中文</a>
+</p>
+
 # ✨ Tiny Qwen
 
 A minimal, easy-to-read PyTorch re-implementation of Qwen2 and Qwen2.5, the open source multi-modal LLM.
