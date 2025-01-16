@@ -1,4 +1,6 @@
-[English](README.md) | [中文](README_zh.md)
+<p align="left">
+    &nbspEnglish&nbsp | <a href="README_CN.md">中文</a>
+</p>
 
 # ✨ Tiny Qwen
 
