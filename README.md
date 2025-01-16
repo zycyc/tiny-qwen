@@ -12,7 +12,7 @@ Keep in mind you'll likely need multiple GPU for models bigger than 32B. Stay tu
 
 ## **Interested in building vision-based AI Agents?**
 
-I’m passionate about automating computer use to free up human labor and would love to collaborate with like-minded people. If this sound like you, please don't hesitate to reach out to me ([My Bio](https://github.com/Emericen))!
+I’m passionate about automating computer use to free up human labor and would love to collaborate with like-minded people. If this sound like you, please don't hesitate to reach out to me 🤗 ([my bio](https://github.com/Emericen))!
 
 # 🦋 Quick Start
 
