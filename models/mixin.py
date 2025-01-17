@@ -1,18 +1,14 @@
 import os
 import json
 from pathlib import Path
-from typing import Optional, Union, Dict, Any
+from typing import Optional, Union, Dict
 import torch
 from dataclasses import dataclass
 
 from models.config import ModelConfig, VisionConfig
-from safetensors.torch import save_file, safe_open
+from safetensors.torch import save_file
 from huggingface_hub import snapshot_download, HfApi
-
-
-LOAD_IN_BF16 = False
-# TODO: vision encoder requires load in full while llm requires load in bf16
-# make this configurable.
+from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 
 
 def _rename_dict_keys(original_dict: dict, key_mapping: dict) -> dict:
@@ -76,7 +72,7 @@ class ModelHubMixin:
     def from_pretrained(
         cls,
         repo_id: Union[str, Path],
-        device: Optional[str] = None,
+        device_map: Optional[Union[str, Dict[str, Union[int, str]]]] = "auto",
         cache_dir: Optional[str] = None,
         local_files_only: bool = False,
         force_download: bool = False,
@@ -107,23 +103,37 @@ class ModelHubMixin:
             vision_config = _filter_dict_by_dataclass(vision_config, VisionConfig)
             model_config.vision_config = VisionConfig(**vision_config)
 
-        # Initialize model
-        if LOAD_IN_BF16:
-            model = cls(model_config).to(torch.bfloat16)
-        else:
+        # Different initialization for vision vs text-only models
+        if cls.__name__ == "Qwen2VL":
+            # TODO: Using Qwen2VL with `init_empty_weights()` results in `NotImplementedError: Cannot copy out of meta tensor; no data! Please use torch.nn.Module.to_empty() instead of torch.nn.Module.to() when moving module from meta to a different device.`
             model = cls(model_config)
+            model = load_checkpoint_and_dispatch(
+                model,
+                model_path,
+                device_map=device_map,
+                dtype=torch.bfloat16,
+                no_split_module_classes=[
+                    "Block",
+                    "Qwen2VLVisionBlock",
+                    "Qwen2VLVisionEncoder",
+                    "PatchEmbed",
+                    "PatchMerger",
+                    "VisionMlp",
+                    "VisionAttention",
+                    "VisionRotaryEmbedding"
+                ],
+            )
+        else:
+            with init_empty_weights():
+                model = cls(model_config)
+            model = load_checkpoint_and_dispatch(
+                model,
+                model_path,
+                device_map=device_map,
+                dtype=torch.bfloat16,
+                no_split_module_classes=["Block"],
+            )
 
-        # Load weights
-        model_files = sorted(model_path.glob("*.safetensors"))
-        state_dict = model.state_dict()
-        for file_path in model_files:
-            with safe_open(file_path, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    if key in state_dict:
-                        tensor = f.get_tensor(key)
-                        state_dict[key].copy_(tensor)
-        if device:
-            model = model.to(device)
         return model
 
     def save_pretrained(
