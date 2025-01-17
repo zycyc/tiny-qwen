@@ -103,17 +103,36 @@ class ModelHubMixin:
             vision_config = _filter_dict_by_dataclass(vision_config, VisionConfig)
             model_config.vision_config = VisionConfig(**vision_config)
 
-        # Initialize empty model and load weights using accelerate
-        with init_empty_weights():
+        # Different initialization for vision vs text-only models
+        if cls.__name__ == "Qwen2VL":
+            # TODO: Using Qwen2VL with `init_empty_weights()` results in `NotImplementedError: Cannot copy out of meta tensor; no data! Please use torch.nn.Module.to_empty() instead of torch.nn.Module.to() when moving module from meta to a different device.`
             model = cls(model_config)
-
-        model = load_checkpoint_and_dispatch(
-            model,
-            model_path,
-            device_map=device_map,
-            dtype=torch.bfloat16,
-            no_split_module_classes=["Block"],  # Prevent splitting attention blocks
-        )
+            model = load_checkpoint_and_dispatch(
+                model,
+                model_path,
+                device_map=device_map,
+                dtype=torch.bfloat16,
+                no_split_module_classes=[
+                    "Block",
+                    "Qwen2VLVisionBlock",
+                    "Qwen2VLVisionEncoder",
+                    "PatchEmbed",
+                    "PatchMerger",
+                    "VisionMlp",
+                    "VisionAttention",
+                    "VisionRotaryEmbedding"
+                ],
+            )
+        else:
+            with init_empty_weights():
+                model = cls(model_config)
+            model = load_checkpoint_and_dispatch(
+                model,
+                model_path,
+                device_map=device_map,
+                dtype=torch.bfloat16,
+                no_split_module_classes=["Block"],
+            )
 
         return model
 
