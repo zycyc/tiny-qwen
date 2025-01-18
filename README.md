@@ -31,7 +31,7 @@ from PIL import Image
 
 # text-only models
 model_name = "Qwen/Qwen2.5-3B"
-model = Qwen2.from_pretrained(repo_id=model_name, device="auto")
+model = Qwen2.from_pretrained(repo_id=model_name, device_map="auto")
 processor = Processor(repo_id=model_name)
 
 context = [
@@ -43,7 +43,7 @@ output_text = processor.tokenizer.decode(output[0].tolist())
 
 # text + vision models
 model_name = "Qwen/Qwen2-VL-2B-Instruct"
-model = Qwen2VL.from_pretrained(repo_id=model_name, device="auto")
+model = Qwen2VL.from_pretrained(repo_id=model_name, device_map="auto")
 processor = Processor(
     repo_id=model_name,
     vision_config=model.config.vision_config,
