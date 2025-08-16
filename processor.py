@@ -2,8 +2,8 @@ import torch
 import numpy as np
 from PIL import Image
 from typing import List, Union, Tuple, Optional
-from models.config import VisionConfig
 from tokenizers import Tokenizer
+from vision import VisionConfig
 
 
 class Processor:

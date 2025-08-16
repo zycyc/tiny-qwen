@@ -3,13 +3,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
+from dataclasses import dataclass
+from vision import Qwen2VLVisionEncoder, VisionConfig
 
-from models.config import ModelConfig
-from models.mixin import ModelHubMixin
-from models.vision import Qwen2VLVisionEncoder
-from models.processor import Processor
 
-from PIL import Image
+@dataclass
+class ModelConfig:
+    n_embed: int
+    n_heads: int
+    n_kv_heads: int
+    n_layer: int
+    n_mlp: int
+    rope_theta: float
+    rms_norm_eps: float
+    vocab_size: int
+    tie_word_embeddings: bool
+    vision_config: Optional[VisionConfig] = None
 
 
 class RotaryEmbedding(nn.Module):
@@ -161,7 +170,7 @@ class Qwen2Model(nn.Module):
         return x
 
 
-class Qwen2VL(nn.Module, ModelHubMixin):
+class Qwen2VL(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
@@ -264,8 +273,14 @@ class Qwen2VL(nn.Module, ModelHubMixin):
             input_ids = torch.cat([input_ids, next_token], dim=1)
         return input_ids
 
+    @classmethod
+    def from_pretrained(cls, repo_id: str, device_map: str = "auto"):
+        from util import load_pretrained_model
+        
+        return load_pretrained_model(cls, repo_id, device_map=device_map)
 
-class Qwen2(nn.Module, ModelHubMixin):
+
+class Qwen2(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
