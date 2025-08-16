@@ -3,7 +3,7 @@ import numpy as np
 from PIL import Image
 from typing import List, Union, Tuple, Optional
 from tokenizers import Tokenizer
-from vision import VisionConfig
+from .vision import VisionConfig
 
 
 class Processor:

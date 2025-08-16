@@ -6,8 +6,8 @@ import torch
 from huggingface_hub import snapshot_download
 from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 
-from model import ModelConfig
-from vision import VisionConfig
+from .model import ModelConfig
+from .vision import VisionConfig
 
 
 def _rename_dict_keys(original_dict: dict, key_mapping: dict) -> dict:

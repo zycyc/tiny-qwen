@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 from dataclasses import dataclass
-from vision import Qwen2VLVisionEncoder, VisionConfig
+from .vision import Qwen2VLVisionEncoder, VisionConfig
 
 
 @dataclass
@@ -275,8 +275,8 @@ class Qwen2VL(nn.Module):
 
     @classmethod
     def from_pretrained(cls, repo_id: str, device_map: str = "auto"):
-        from util import load_pretrained_model
-        
+        from .util import load_pretrained_model
+
         return load_pretrained_model(cls, repo_id, device_map=device_map)
 
 
@@ -317,3 +317,9 @@ class Qwen2(nn.Module):
             next_token = probs.argmax(dim=-1, keepdim=True)
             input_ids = torch.cat([input_ids, next_token], dim=1)
         return input_ids
+
+    @classmethod
+    def from_pretrained(cls, repo_id: str, device_map: str = "auto"):
+        from .util import load_pretrained_model
+
+        return load_pretrained_model(cls, repo_id, device_map=device_map)
