@@ -20,6 +20,11 @@ class ModelConfig:
     tie_word_embeddings: bool
     vision_config: Optional[VisionConfig] = None
 
+    # MoE parameters
+    num_experts: Optional[int] = None
+    num_experts_per_tok: Optional[int] = None
+    moe_intermediate_size: Optional[int] = None
+
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, config):
@@ -139,6 +144,77 @@ class MLP(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
+class MoEFeedForward(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.num_experts = config.num_experts
+        self.gate = nn.Linear(config.n_embed, config.num_experts, bias=False)
+
+        # Use meta device to reduce memory pressure during initialization
+        meta_device = torch.device("meta")
+        self.fc1 = nn.ModuleList(
+            [
+                nn.Linear(
+                    config.n_embed,
+                    config.moe_intermediate_size,
+                    bias=False,
+                    device=meta_device,
+                )
+                for _ in range(config.num_experts)
+            ]
+        )
+        self.fc2 = nn.ModuleList(
+            [
+                nn.Linear(
+                    config.n_embed,
+                    config.moe_intermediate_size,
+                    bias=False,
+                    device=meta_device,
+                )
+                for _ in range(config.num_experts)
+            ]
+        )
+        self.fc3 = nn.ModuleList(
+            [
+                nn.Linear(
+                    config.moe_intermediate_size,
+                    config.n_embed,
+                    bias=False,
+                    device=meta_device,
+                )
+                for _ in range(config.num_experts)
+            ]
+        )
+
+    def forward(self, x):
+        b, seq_len, embed_dim = x.shape
+        scores = self.gate(x)  # (b, seq_len, num_experts)
+        topk_scores, topk_indices = torch.topk(scores, self.num_experts_per_tok, dim=-1)
+        topk_probs = torch.softmax(topk_scores, dim=-1)
+
+        expert_outputs = []
+        for e in range(self.num_experts):
+            hidden = F.silu(self.fc1[e](x)) * self.fc2[e](x)
+            out = self.fc3[e](hidden)
+            expert_outputs.append(out.unsqueeze(-2))
+        expert_outputs = torch.cat(
+            expert_outputs, dim=-2
+        )  # (b, t, num_experts, emb_dim)
+
+        gating_probs = torch.zeros_like(scores)
+
+        for i in range(self.num_experts_per_tok):
+            indices = topk_indices[..., i : i + 1]
+            prob = topk_probs[..., i : i + 1]
+            gating_probs.scatter_(dim=-1, index=indices, src=prob)
+        gating_probs = gating_probs.unsqueeze(-1)  # (b, t, num_experts, 1)
+
+        # Weighted sum over experts
+        y = (gating_probs * expert_outputs).sum(dim=-2)
+        return y
+
+
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -147,6 +223,26 @@ class Block(nn.Module):
         self.self_attn = CausalSelfAttention(config)
         self.post_attention_layernorm = RMSNorm(n_embed=n_embed, eps=eps)
         self.mlp = MLP(config)
+
+    def forward(self, x, cos, sin):
+        x = x + self.self_attn(self.input_layernorm(x), cos, sin)
+        x = x + self.mlp(self.post_attention_layernorm(x))
+        return x
+
+
+class MoEBlock(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        n_embed, eps = config.n_embed, config.rms_norm_eps
+        self.input_layernorm = RMSNorm(n_embed=n_embed, eps=eps)
+        self.self_attn = CausalSelfAttention(config)
+        self.post_attention_layernorm = RMSNorm(n_embed=n_embed, eps=eps)
+
+        # Use MoE if experts are configured, otherwise regular MLP
+        if config.num_experts and config.num_experts > 0:
+            self.mlp = MoEFeedForward(config)
+        else:
+            self.mlp = MLP(config)
 
     def forward(self, x, cos, sin):
         x = x + self.self_attn(self.input_layernorm(x), cos, sin)
@@ -316,6 +412,79 @@ class Qwen2(nn.Module):
             probs = F.softmax(last_logits, dim=-1)
             next_token = probs.argmax(dim=-1, keepdim=True)
             input_ids = torch.cat([input_ids, next_token], dim=1)
+        return input_ids
+
+    @classmethod
+    def from_pretrained(cls, repo_id: str, device_map: str = "auto"):
+        from .util import load_pretrained_model
+
+        return load_pretrained_model(cls, repo_id, device_map=device_map)
+
+
+class Qwen3Model(nn.Module):
+    """Qwen3 model with MoE support - based on textbook implementation"""
+
+    def __init__(self, config):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.n_embed)
+        self.rotary_emb = RotaryEmbedding(config)
+
+        # Use MoEBlock instead of regular Block
+        self.layers = nn.ModuleList(MoEBlock(config) for _ in range(config.n_layer))
+        self.norm = RMSNorm(config.n_embed, eps=config.rms_norm_eps)
+
+        # Store config for convenience
+        self.config = config
+
+    def forward(self, x, position_ids):
+        cos, sin = self.rotary_emb(x, position_ids)
+        for layer in self.layers:
+            x = layer(x, cos, sin)
+        x = self.norm(x)
+        return x
+
+
+class Qwen3(nn.Module):
+    """Qwen3 MoE model - text-only version"""
+
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+        self.model = Qwen3Model(config)
+
+        self.lm_head = None
+        if not config.tie_word_embeddings:
+            self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
+
+    def _get_position_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        B, T = input_ids.shape
+        device = input_ids.device
+        position_ids = torch.arange(T, dtype=torch.long, device=device)
+        position_ids = position_ids.unsqueeze(0).expand(B, -1)
+        return position_ids
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        x = self.model.embed_tokens(input_ids)
+        position_ids = self._get_position_ids(input_ids)
+        x = self.model(x=x, position_ids=position_ids)
+
+        if self.lm_head is None:
+            logits = torch.matmul(x, self.model.embed_tokens.weight.T)
+        else:
+            logits = self.lm_head(x)
+        return logits
+
+    def generate(
+        self, input_ids: torch.Tensor, max_new_tokens: int = 1
+    ) -> torch.Tensor:
+        self.eval()
+        with torch.no_grad():
+            for _ in range(max_new_tokens):
+                logits = self.forward(input_ids=input_ids)
+                last_logits = logits[:, -1, :]
+                probs = F.softmax(last_logits, dim=-1)
+                next_token = probs.argmax(dim=-1, keepdim=True)
+                input_ids = torch.cat([input_ids, next_token], dim=1)
         return input_ids
 
     @classmethod
