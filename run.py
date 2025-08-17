@@ -1,11 +1,7 @@
 import os
-import sys
 import re
-from pathlib import Path
 from PIL import Image
 import torch
-
-import dotenv
 
 import typer
 import questionary
@@ -15,8 +11,6 @@ from rich.text import Text
 
 from model.processor import Processor
 from model.model import Qwen2VL, Qwen3, Qwen3MoE
-
-dotenv.load_dotenv()
 
 ASCII_LOGO = """
 ██╗    ████████╗██╗███╗   ██╗██╗   ██╗    ██████╗ ██╗    ██╗███████╗███╗   ██╗
