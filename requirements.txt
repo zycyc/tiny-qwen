@@ -1,4 +1,4 @@
-torch==2.7.0+cu126
+torch
 safetensors==0.5.3
 datasets==3.6.0
 tokenizers==0.21.1 
@@ -8,3 +8,4 @@ pillow==11.2.1
 matplotlib==3.10.3
 typer==0.15.3
 rich==14.0.0
+questionary==2.0.1

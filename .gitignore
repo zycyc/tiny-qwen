@@ -9,3 +9,6 @@ cache
 venv
 test.py
 textbook/
+.env
+transformers/
+tokenizers/

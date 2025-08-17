@@ -1,328 +1,27 @@
-# #!/usr/bin/env python3
-# import sys
-# import re
-# from pathlib import Path
-# from PIL import Image
-# import torch
+import os
+import sys
+import re
+import base64
+import mimetypes
+from pathlib import Path
+from PIL import Image
+import torch
 
-# import typer
-# from rich.console import Console
-# from rich.panel import Panel
-# from rich.table import Table
-# from rich.prompt import Prompt, Confirm
-# from rich.text import Text
+import anthropic
+import dotenv
 
-# from util import load_pretrained_model, generate_text_stream, generate_multimodal_stream
-# from processor import Processor
-
-# console = Console()
-# app = typer.Typer(help="> Tiny-Qwen Interactive Chat")
-
-
-# class QwenREPL:
-#     def __init__(self):
-#         self.model = None
-#         self.tokenizer = None
-#         self.processor = None
-#         self.model_type = None
-#         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-
-#     def show_welcome(self):
-#         """Show welcome screen and model selection"""
-#         console.print(Panel.fit(">Tiny-Qwen Interactive Chat", style="bold blue"))
-
-#         # Available models table
-#         table = Table(
-#             title="Available Models", show_header=True, header_style="bold magenta"
-#         )
-#         table.add_column("Model ID", style="cyan")
-#         table.add_column("Type", style="green")
-#         table.add_column("Description", style="white")
-
-#         # Text-only models
-#         table.add_row("Qwen/Qwen2-0.5B-Instruct", "Text", "Qwen2 0.5B chat model")
-#         table.add_row("Qwen/Qwen2-1.5B-Instruct", "Text", "Qwen2 1.5B chat model")
-#         table.add_row("Qwen/Qwen2-7B-Instruct", "Text", "Qwen2 7B chat model")
-
-#         # Vision models
-#         table.add_row(
-#             "Qwen/Qwen2.5-VL-2B-Instruct", "Vision+Text", "Qwen2.5-VL 2B multimodal"
-#         )
-#         table.add_row(
-#             "Qwen/Qwen2.5-VL-7B-Instruct", "Vision+Text", "Qwen2.5-VL 7B multimodal"
-#         )
-
-#         console.print(table)
-
-#     def select_model(self) -> str:
-#         """Interactive model selection"""
-#         default_models = [
-#             "Qwen/Qwen2.5-VL-3B-Instruct",
-#             "Qwen/Qwen2.5-3B",
-#         ]
-
-#         console.print("\n[bold]Select a model:[/bold]")
-#         for i, model in enumerate(default_models, 1):
-#             console.print(f"  {i}. {model}")
-#         console.print("  0. Enter custom model ID")
-
-#         choice = Prompt.ask(
-#             "Choose",
-#             choices=[str(i) for i in range(len(default_models) + 1)],
-#             default="1",
-#         )
-
-#         if choice == "0":
-#             return Prompt.ask("Enter model ID")
-#         else:
-#             return default_models[int(choice) - 1]
-
-#     def load_model(self, model_id: str):
-#         """Load model and tokenizer"""
-#         try:
-#             console.print(f"\n= Loading {model_id}...")
-#             self.model, self.tokenizer = load_pretrained_model(
-#                 model_id, device=self.device
-#             )
-
-#             # Determine if this is a vision model
-#             if "vl" in model_id.lower():
-#                 self.model_type = "vision"
-#                 # For vision models, we'll need the processor too
-#                 self.processor = Processor(model_id, self.model.config.vision_config)
-#             else:
-#                 self.model_type = "text"
-
-#             console.print(" Model loaded successfully!\n")
-#             return True
-
-#         except Exception as e:
-#             console.print(f"[red]L Error loading model: {e}[/red]")
-#             return False
-
-#     def show_help(self):
-#         """Show help information"""
-#         if self.model_type == "vision":
-#             help_text = """
-# [bold]Commands:[/bold]
-#   /help    - Show this help
-#   /exit    - Exit the chat
-#   /clear   - Clear conversation history
-  
-# [bold]Vision Model Usage:[/bold]
-#   @path/image.jpg your question about the image
-#   @img1.png @img2.jpg compare these images
-  
-# [bold]Examples:[/bold]
-#   @receipt.jpg how much do I need to pay?
-#   @diagram.png explain this flowchart
-#   @photo1.jpg @photo2.jpg what's different between these?
-#             """
-#         else:
-#             help_text = """
-# [bold]Commands:[/bold]
-#   /help    - Show this help  
-#   /exit    - Exit the chat
-#   /clear   - Clear conversation history
-  
-# [bold]Text Model Usage:[/bold]
-#   Just type your message and press Enter
-#             """
-
-#         console.print(Panel(help_text, title="Help", style="blue"))
-
-#     def parse_input(self, user_input: str) -> tuple[list, str]:
-#         """
-#         Parse input like '@path/image.jpg this is my receipt...' into [image, text]
-#         Returns: ([inputs], input_type)
-#         """
-#         if self.model_type != "vision":
-#             # Text-only model - no image parsing
-#             return [user_input], "text"
-
-#         # Find all @path patterns for vision models
-#         image_pattern = r"@([^\s]+\.(jpg|jpeg|png|webp|gif|bmp))"
-#         matches = re.findall(image_pattern, user_input, re.IGNORECASE)
-
-#         if not matches:
-#             # Pure text
-#             return [user_input], "text"
-
-#         # Process mixed input
-#         inputs = []
-#         remaining_text = user_input
-
-#         for match in matches:
-#             image_path = match[0]  # match[1] is the extension
-
-#             # Load image
-#             try:
-#                 if not Path(image_path).exists():
-#                     console.print(f"[yellow] Image not found: {image_path}[/yellow]")
-#                     continue
-
-#                 image = Image.open(image_path)
-#                 inputs.append(image)
-
-#                 # Remove @path from text
-#                 remaining_text = remaining_text.replace(f"@{image_path}", "", 1)
-#                 console.print(f"=� Loaded image: {image_path}")
-
-#             except Exception as e:
-#                 console.print(f"[red]L Error loading image {image_path}: {e}[/red]")
-#                 return [user_input], "text"  # Fallback to text-only
-
-#         # Add remaining text (cleaned)
-#         cleaned_text = remaining_text.strip()
-#         if cleaned_text:
-#             inputs.append(cleaned_text)
-
-#         return inputs, "multimodal"
-
-#     def chat(self, user_inputs: list, input_type: str) -> str:
-#         """Process user input and generate response"""
-#         try:
-#             if input_type == "multimodal" and self.processor:
-#                 # Use processor for multimodal inputs
-#                 processed = self.processor(user_inputs, device=self.device)
-#                 response_tokens = []
-
-#                 # Generate with multimodal input
-#                 for token_text in generate_text_stream(
-#                     model=self.model,
-#                     tokenizer=self.tokenizer,
-#                     prompt="",  # Prompt is already processed
-#                     max_new_tokens=200,
-#                 ):
-#                     response_tokens.append(token_text)
-
-#                 return "".join(response_tokens)
-
-#             else:
-#                 # Text-only generation
-#                 prompt = user_inputs[0] if user_inputs else ""
-#                 response_tokens = []
-
-#                 for token_text in generate_text_stream(
-#                     model=self.model,
-#                     tokenizer=self.tokenizer,
-#                     prompt=prompt,
-#                     max_new_tokens=200,
-#                 ):
-#                     response_tokens.append(token_text)
-
-#                 return "".join(response_tokens)
-
-#         except Exception as e:
-#             return f"Error generating response: {e}"
-
-#     def run(self):
-#         """Main REPL loop"""
-#         self.show_welcome()
-
-#         # Model selection loop
-#         while True:
-#             model_id = self.select_model()
-#             if self.load_model(model_id):
-#                 break
-#             else:
-#                 if not Confirm.ask("Try another model?"):
-#                     return
-
-#         # Show usage hint for VL models
-#         if self.model_type == "vision":
-#             console.print(
-#                 Panel(
-#                     "=� [bold]Tip:[/bold] Use @path/image.jpg to include images in your messages\nType /help for more info",
-#                     style="yellow",
-#                 )
-#             )
-
-#         console.print("Type /help for commands or start chatting!")
-#         console.print("-" * 50)
-
-#         # Main chat loop
-#         while True:
-#             try:
-#                 user_input = Prompt.ask("\n[bold blue]You[/bold blue]")
-
-#                 if user_input.startswith("/"):
-#                     if user_input == "/exit":
-#                         console.print("=K Goodbye!")
-#                         break
-#                     elif user_input == "/help":
-#                         self.show_help()
-#                         continue
-#                     elif user_input == "/clear":
-#                         console.clear()
-#                         continue
-#                     else:
-#                         console.print(
-#                             "[yellow]Unknown command. Type /help for available commands.[/yellow]"
-#                         )
-#                         continue
-
-#                 # Process and respond
-#                 inputs, input_type = self.parse_input(user_input)
-
-#                 console.print(f"\n[bold green]Assistant[/bold green]: ", end="")
-
-#                 # Stream the response
-#                 response_parts = []
-#                 try:
-#                     if input_type == "multimodal" and self.processor:
-#                         # Handle multimodal input
-#                         processed = self.processor(inputs, device=self.device)
-#                         # Use proper multimodal generation
-#                         for token in generate_multimodal_stream(
-#                             self.model, self.tokenizer, processed, max_new_tokens=200
-#                         ):
-#                             console.print(token, end="", style="green")
-#                             response_parts.append(token)
-#                     else:
-#                         # Text-only generation
-#                         for token in generate_text_stream(
-#                             self.model, self.tokenizer, inputs[0], max_new_tokens=200
-#                         ):
-#                             console.print(token, end="", style="green")
-#                             response_parts.append(token)
-
-#                 except KeyboardInterrupt:
-#                     console.print("\n[yellow] Generation stopped[/yellow]")
-#                 except Exception as e:
-#                     console.print(f"\n[red]L Generation error: {e}[/red]")
-
-#                 console.print()  # New line after response
-
-#             except KeyboardInterrupt:
-#                 if Confirm.ask("\nExit chat?"):
-#                     break
-#             except Exception as e:
-#                 console.print(f"[red]Error: {e}[/red]")
-
-
-# @app.command()
-# def main():
-#     """Launch the Tiny-Qwen interactive chat interface"""
-#     try:
-#         repl = QwenREPL()
-#         repl.run()
-#     except KeyboardInterrupt:
-#         console.print("\n=K Goodbye!")
-#     except Exception as e:
-#         console.print(f"[red]Fatal error: {e}[/red]")
-#         raise
-
-
-# if __name__ == "__main__":
-#     app()
-
-
-
+import typer
+import questionary
+from questionary import Choice, Style
 from rich.console import Console
 from rich.text import Text
 
-ascii_logo = """
+from model.processor import Processor
+from model.model import Qwen2VL, Qwen3, Qwen3MoE
+
+dotenv.load_dotenv()
+
+ASCII_LOGO = """
 ██╗    ████████╗██╗███╗   ██╗██╗   ██╗    ██████╗ ██╗    ██╗███████╗███╗   ██╗
 ╚██╗   ╚══██╔══╝██║████╗  ██║╚██╗ ██╔╝   ██╔═══██╗██║    ██║██╔════╝████╗  ██║
  ╚██╗     ██║   ██║██╔██╗ ██║ ╚████╔╝    ██║   ██║██║ █╗ ██║█████╗  ██╔██╗ ██║
@@ -331,7 +30,263 @@ ascii_logo = """
 ╚═╝       ╚═╝   ╚═╝╚═╝  ╚═══╝   ╚═╝       ╚══▀▀═╝  ╚══╝╚══╝ ╚══════╝╚═╝  ╚═══╝
 """
 
+STARTING_HELP_TEXT = """
+Welcome to Tiny-Qwen Interactive Chat!
 
-console = Console()
-yellow_logo = Text(ascii_logo, style="cyan")
-console.print(yellow_logo)
+Tips:
+1. /help for more information.
+2. /exit or Ctrl+C to exit.
+"""
+
+HELP_TEXT = """
+Available commands:
+/help - Show this help message
+/exit - Exit the application
+
+For vision models, use @path/to/image.jpg to include images in your messages.
+"""
+
+# Mapping of all models: generation -> variant -> HF repo id
+ALL_MODELS = {
+    "Qwen2.5-VL": {
+        "Qwen2.5-VL-3B-Instruct": "Qwen/Qwen2.5-VL-3B-Instruct",
+        "Qwen2.5-VL-7B-Instruct": "Qwen/Qwen2.5-VL-7B-Instruct",
+        "Qwen2.5-VL-32B-Instruct": "Qwen/Qwen2.5-VL-32B-Instruct",
+        "Qwen2.5-VL-72B-Instruct": "Qwen/Qwen2.5-VL-72B-Instruct",
+    },
+    "Qwen3": {
+        "Qwen3-0.6B": "Qwen/Qwen3-0.6B",
+        "Qwen3-1.7B": "Qwen/Qwen3-1.7B",
+        "Qwen3-4B": "Qwen/Qwen3-4B",
+        "Qwen3-8B": "Qwen/Qwen3-8B",
+        "Qwen3-14B": "Qwen/Qwen3-14B",
+        "Qwen3-32B": "Qwen/Qwen3-32B",
+        "Qwen3-4B-Instruct-2507": "Qwen/Qwen3-4B-Instruct-2507",
+        "Qwen3-30B-A3B-Instruct-2507": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        "Qwen3-235B-A22B-Instruct-2507": "Qwen/Qwen3-235B-A22B-Instruct-2507",
+        "Qwen3-4B-Thinking-2507": "Qwen/Qwen3-4B-Thinking-2507",
+        "Qwen3-30B-A3B-Thinking-2507": "Qwen/Qwen3-30B-A3B-Thinking-2507",
+        "Qwen3-235B-A22B-Thinking-2507": "Qwen/Qwen3-235B-A22B-Thinking-2507",
+    },
+}
+
+REPO_ID_TO_MODEL_CLASS = {
+    "Qwen/Qwen2.5-VL-3B-Instruct": Qwen2VL,
+    "Qwen/Qwen2.5-VL-7B-Instruct": Qwen2VL,
+    "Qwen/Qwen2.5-VL-32B-Instruct": Qwen2VL,
+    "Qwen/Qwen2.5-VL-72B-Instruct": Qwen2VL,
+    
+    "Qwen/Qwen3-0.6B": Qwen3,
+    "Qwen/Qwen3-1.7B": Qwen3,
+    "Qwen/Qwen3-4B": Qwen3,
+    "Qwen/Qwen3-8B": Qwen3,
+    "Qwen/Qwen3-14B": Qwen3,
+    "Qwen/Qwen3-32B": Qwen3,
+
+    "Qwen/Qwen3-4B-Instruct-2507": Qwen3MoE,
+    "Qwen/Qwen3-30B-A3B-Instruct-2507": Qwen3MoE,
+    "Qwen/Qwen3-235B-A22B-Instruct-2507": Qwen3MoE,
+    "Qwen/Qwen3-4B-Thinking-2507": Qwen3MoE,
+    "Qwen/Qwen3-30B-A3B-Thinking-2507": Qwen3MoE,
+    "Qwen/Qwen3-235B-A22B-Thinking-2507": Qwen3MoE,
+}
+
+
+
+
+STYLE = Style(
+    [
+        ("question", "bold"),
+        ("selected", "fg:#000000 bg:#face0a bold"),
+        ("highlighted", "fg:#face0a bold"),
+        ("instruction", "fg:#888888"),
+        ("separator", "fg:#666666"),
+        ("text", ""),
+        ("qmark", "fg:#face0a"),
+    ]
+)
+
+console = Console(highlight=False)
+app = typer.Typer(add_completion=False)
+
+
+def parse_message_with_images(text):
+    """Parse a message that may contain @path/to/image.jpg references and convert to Claude format."""
+    # Find all @path patterns
+    image_pattern = r'@([^\s]+\.(?:jpg|jpeg|png|gif|webp))'
+    matches = re.finditer(image_pattern, text, re.IGNORECASE)
+    
+    content_blocks = []
+    last_end = 0
+    
+    for match in matches:
+        # Add text before the image reference
+        if match.start() > last_end:
+            text_part = text[last_end:match.start()].strip()
+            if text_part:
+                content_blocks.append({
+                    "type": "text",
+                    "text": text_part
+                })
+        
+        # Process the image
+        image_path = match.group(1)
+        try:
+            # Check if file exists
+            if not os.path.exists(image_path):
+                console.print(f"Warning: Image file not found: {image_path}", style="yellow")
+                continue
+                
+            # Get MIME type
+            mime_type, _ = mimetypes.guess_type(image_path)
+            if not mime_type or not mime_type.startswith('image/'):
+                console.print(f"Warning: Invalid image type: {image_path}", style="yellow")
+                continue
+            
+            # Read and encode image
+            with open(image_path, "rb") as image_file:
+                image_data = base64.b64encode(image_file.read()).decode('utf-8')
+                
+            content_blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": mime_type,
+                    "data": image_data
+                }
+            })
+            
+            console.print(f"✓ Loaded image: {image_path}", style="green")
+            
+        except Exception as e:
+            console.print(f"Error loading image {image_path}: {e}", style="red")
+            continue
+            
+        last_end = match.end()
+    
+    # Add remaining text
+    if last_end < len(text):
+        remaining_text = text[last_end:].strip()
+        if remaining_text:
+            content_blocks.append({
+                "type": "text",
+                "text": remaining_text
+            })
+    
+    # If no images found, return simple text format
+    if not content_blocks:
+        return text
+    
+    # If only text, return as string
+    if len(content_blocks) == 1 and content_blocks[0]["type"] == "text":
+        return content_blocks[0]["text"]
+    
+    return content_blocks
+
+
+@app.command()
+def main():
+
+    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+
+
+    try:
+        # Clear the terminal
+        os.system("cls" if os.name == "nt" else "clear")
+
+        # Show logo and help message
+        yellow_logo = Text(ASCII_LOGO, style="#face0a")
+        console.print(yellow_logo)
+        console.print(STARTING_HELP_TEXT)
+
+        # Select model generation e.g. Qwen2, Qwen2.5, Qwen2.5-VL, Qwen3, etc.
+        selected_model_generation = questionary.select(
+            message="Select model",
+            choices=[Choice(generation, generation) for generation in ALL_MODELS],
+            pointer=">",
+            qmark="",
+            style=STYLE,
+        ).ask()
+
+        if not selected_model_generation:
+            return
+
+        # Select model variant e.g. Qwen2-0.5B-Instruct, Qwen2.5-1.5B-Instruct, etc.
+        selected_model_variant = questionary.select(
+            message="Select model variant",
+            choices=[
+                Choice(variant, variant)
+                for variant in ALL_MODELS[selected_model_generation]
+            ],
+            pointer=">",
+            qmark="",
+            style=STYLE,
+        ).ask()
+
+        if not selected_model_variant:
+            return
+
+        hf_repo_id = ALL_MODELS[selected_model_generation][selected_model_variant]
+        console.print(f"\nLoading model: {hf_repo_id}")
+
+        model_class = REPO_ID_TO_MODEL_CLASS.get(hf_repo_id)
+        if not model_class:
+            console.print("Invalid model variant", style="red")
+            return
+
+        model = model_class.from_pretrained(hf_repo_id)
+        processor = Processor(repo_id=hf_repo_id)
+        if not model or not processor:
+            console.print("Failed to load model. Exiting...", style="red")
+            return
+
+        # Start the interactive chat loop
+        messages = []
+        while True:
+            # Get user input
+            user_input = input("> ").strip()
+
+            # Handle special commands
+            if user_input == "/exit":
+                console.print("Goodbye!")
+                break
+            elif user_input == "/help":
+                console.print(HELP_TEXT)
+                continue
+            elif not user_input:
+                continue
+
+            # Parse message for images
+            parsed_content = parse_message_with_images(user_input)
+            messages.append({"role": "user", "content": parsed_content})
+            
+            try:
+                with client.messages.stream(
+                    model="claude-sonnet-4-20250514",
+                    messages=messages,
+                    max_tokens=1024,
+                ) as stream:
+                    assistant_response = ""
+                    for text in stream.text_stream:
+                        print(text, end="", flush=True)
+                        assistant_response += text
+                    print()
+                    
+                # Add assistant's response to messages
+                messages.append({"role": "assistant", "content": assistant_response})
+                
+            except Exception as e:
+                console.print(f"Error generating response: {e}", style="red")
+                # Remove the failed user message
+                messages.pop()
+
+    except KeyboardInterrupt:
+        console.print("\nGoodbye!")
+    except Exception as e:
+        console.print(f"Error: {e}", style="red")
+        raise
+
+
+if __name__ == "__main__":
+    app()

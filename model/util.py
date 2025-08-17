@@ -3,11 +3,13 @@ import json
 from pathlib import Path
 from typing import Optional, Union, Dict
 import torch
-from huggingface_hub import snapshot_download
+from huggingface_hub import snapshot_download, logging
 from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 
 from .model import ModelConfig
 from .vision import VisionConfig
+
+logging.set_verbosity_error()
 
 
 def _rename_dict_keys(original_dict: dict, key_mapping: dict) -> dict:

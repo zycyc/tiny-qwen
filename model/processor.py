@@ -29,13 +29,17 @@ class Processor:
 
     def __call__(
         self,
-        inputs: List[Union[str, Image.Image]],
+        # inputs: List[Union[str, Image.Image]],
+        messages: List[dict],
         device: Optional[Union[str, torch.device]] = None,
     ) -> dict:
         """
         Process a list of text and/or image inputs.
         If vision_config is None, images are not allowed.
         """
+
+        inputs = self.apply_chat_template(messages)
+
         # Data accumulators
         input_ids = []
         pixels_list = []
@@ -95,6 +99,9 @@ class Processor:
             "pixels": pixels,
             "d_image": d_image,
         }
+
+    def apply_chat_template(self, messages: List[dict]) -> List[Union[str, Image.Image]]:
+        return self.tokenizer.apply_chat_template(messages, tokenize=False)
 
     def _smart_resize(
         self, height: int, width: int, factor: int = 28
