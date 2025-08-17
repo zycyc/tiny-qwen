@@ -101,7 +101,32 @@ class Processor:
         }
 
     def apply_chat_template(self, messages: List[dict]) -> List[Union[str, Image.Image]]:
-        return self.tokenizer.apply_chat_template(messages, tokenize=False)
+        # Simple implementation since tokenizer doesn't have apply_chat_template
+        if isinstance(messages, list) and len(messages) > 0 and isinstance(messages[0], dict):
+            # Standard messages format - convert to our mixed format
+            result = []
+            for message in messages:
+                if message["role"] == "user":
+                    result.append(f"<|im_start|>user\n")
+                    content = message["content"]
+                    if isinstance(content, str):
+                        result.append(content)
+                    elif isinstance(content, list):
+                        for item in content:
+                            if item["type"] == "text":
+                                result.append(item["text"])
+                            elif item["type"] == "image":
+                                result.extend(["<|vision_start|>", Image.open(item["image"]), "<|vision_end|>"])
+                    result.append("<|im_end|>\n")
+                elif message["role"] == "assistant":
+                    result.append(f"<|im_start|>assistant\n{message['content']}<|im_end|>\n")
+            
+            # Add generation prompt
+            result.append("<|im_start|>assistant\n")
+            return result
+        else:
+            # Already in our mixed format, return as-is
+            return messages
 
     def _smart_resize(
         self, height: int, width: int, factor: int = 28

@@ -1,13 +1,10 @@
 import os
 import sys
 import re
-import base64
-import mimetypes
 from pathlib import Path
 from PIL import Image
 import torch
 
-import anthropic
 import dotenv
 
 import typer
@@ -75,14 +72,12 @@ REPO_ID_TO_MODEL_CLASS = {
     "Qwen/Qwen2.5-VL-7B-Instruct": Qwen2VL,
     "Qwen/Qwen2.5-VL-32B-Instruct": Qwen2VL,
     "Qwen/Qwen2.5-VL-72B-Instruct": Qwen2VL,
-    
     "Qwen/Qwen3-0.6B": Qwen3,
     "Qwen/Qwen3-1.7B": Qwen3,
     "Qwen/Qwen3-4B": Qwen3,
     "Qwen/Qwen3-8B": Qwen3,
     "Qwen/Qwen3-14B": Qwen3,
     "Qwen/Qwen3-32B": Qwen3,
-
     "Qwen/Qwen3-4B-Instruct-2507": Qwen3MoE,
     "Qwen/Qwen3-30B-A3B-Instruct-2507": Qwen3MoE,
     "Qwen/Qwen3-235B-A22B-Instruct-2507": Qwen3MoE,
@@ -90,9 +85,6 @@ REPO_ID_TO_MODEL_CLASS = {
     "Qwen/Qwen3-30B-A3B-Thinking-2507": Qwen3MoE,
     "Qwen/Qwen3-235B-A22B-Thinking-2507": Qwen3MoE,
 }
-
-
-
 
 STYLE = Style(
     [
@@ -110,86 +102,113 @@ console = Console(highlight=False)
 app = typer.Typer(add_completion=False)
 
 
-def parse_message_with_images(text):
-    """Parse a message that may contain @path/to/image.jpg references and convert to Claude format."""
-    # Find all @path patterns
-    image_pattern = r'@([^\s]+\.(?:jpg|jpeg|png|gif|webp))'
-    matches = re.finditer(image_pattern, text, re.IGNORECASE)
-    
-    content_blocks = []
+def parse_user_input(text):
+    """Convert @path/to/image.jpg syntax to standard messages format."""
+    image_pattern = r"@([^\s]+\.(?:jpg|jpeg|png|gif|webp))"
+    matches = list(re.finditer(image_pattern, text, re.IGNORECASE))
+
+    if not matches:
+        # No images, return simple text message
+        return [{"role": "user", "content": text}]
+
+    # Build content list with text and images
+    content = []
     last_end = 0
-    
+
     for match in matches:
-        # Add text before the image reference
+        # Add text before image
         if match.start() > last_end:
-            text_part = text[last_end:match.start()].strip()
+            text_part = text[last_end : match.start()].strip()
             if text_part:
-                content_blocks.append({
-                    "type": "text",
-                    "text": text_part
-                })
-        
-        # Process the image
+                content.append({"type": "text", "text": text_part})
+
+        # Add image
         image_path = match.group(1)
-        try:
-            # Check if file exists
-            if not os.path.exists(image_path):
-                console.print(f"Warning: Image file not found: {image_path}", style="yellow")
-                continue
-                
-            # Get MIME type
-            mime_type, _ = mimetypes.guess_type(image_path)
-            if not mime_type or not mime_type.startswith('image/'):
-                console.print(f"Warning: Invalid image type: {image_path}", style="yellow")
-                continue
-            
-            # Read and encode image
-            with open(image_path, "rb") as image_file:
-                image_data = base64.b64encode(image_file.read()).decode('utf-8')
-                
-            content_blocks.append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": mime_type,
-                    "data": image_data
-                }
-            })
-            
-            console.print(f"✓ Loaded image: {image_path}", style="green")
-            
-        except Exception as e:
-            console.print(f"Error loading image {image_path}: {e}", style="red")
-            continue
-            
+        if os.path.exists(image_path):
+            content.append({"type": "image", "image": image_path})
+            console.print(f"✓ Found image: {image_path}", style="green")
+        else:
+            console.print(f"Warning: Image not found: {image_path}", style="yellow")
+
         last_end = match.end()
-    
+
     # Add remaining text
     if last_end < len(text):
         remaining_text = text[last_end:].strip()
         if remaining_text:
-            content_blocks.append({
-                "type": "text",
-                "text": remaining_text
-            })
-    
-    # If no images found, return simple text format
-    if not content_blocks:
-        return text
-    
-    # If only text, return as string
-    if len(content_blocks) == 1 and content_blocks[0]["type"] == "text":
-        return content_blocks[0]["text"]
-    
-    return content_blocks
+            content.append({"type": "text", "text": remaining_text})
+
+    return [{"role": "user", "content": content}]
+
+
+def extract_images_from_messages(messages):
+    """Extract PIL images from messages (like process_vision_info)."""
+    images = []
+    for message in messages:
+        content = message.get("content", [])
+        if isinstance(content, str):
+            continue
+        for item in content:
+            if item.get("type") == "image":
+                image_path = item["image"]
+                try:
+                    pil_image = Image.open(image_path)
+                    images.append(pil_image)
+                except Exception as e:
+                    console.print(f"Error loading {image_path}: {e}", style="red")
+    return images
+
+
+def generate_local_response(
+    messages, model, processor, model_generation, max_tokens=128
+):
+    """Generate response using local model."""
+    # Use processor directly - it now handles both message formats
+    inputs = processor(messages)
+
+    # Move inputs to same device as model
+    device = next(model.parameters()).device
+    inputs["input_ids"] = inputs["input_ids"].to(device)
+    if inputs["pixels"] is not None:
+        inputs["pixels"] = inputs["pixels"].to(device)
+    if inputs["d_image"] is not None:
+        inputs["d_image"] = inputs["d_image"].to(device)
+
+    # Generate
+    with torch.no_grad():
+        if model_generation == "Qwen2.5-VL":
+            if inputs["pixels"] is not None:
+                # Vision model with images
+                output_ids = model.generate(
+                    input_ids=inputs["input_ids"],
+                    pixels=inputs["pixels"],
+                    d_image=inputs["d_image"],
+                    max_new_tokens=max_tokens,
+                )
+            else:
+                # Vision model, text-only
+                output_ids = model.generate(
+                    input_ids=inputs["input_ids"],
+                    pixels=None,
+                    d_image=None,
+                    max_new_tokens=max_tokens,
+                )
+        else:
+            # Text-only model
+            output_ids = model.generate(
+                input_ids=inputs["input_ids"], max_new_tokens=max_tokens
+            )
+
+    # Decode response (skip the input tokens)
+    input_length = inputs["input_ids"].shape[1]
+    response_ids = output_ids[:, input_length:]
+    response = processor.tokenizer.decode(response_ids[0].tolist())
+
+    return response
 
 
 @app.command()
 def main():
-
-    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-
-
 
     try:
         # Clear the terminal
@@ -236,7 +255,30 @@ def main():
             return
 
         model = model_class.from_pretrained(hf_repo_id)
-        processor = Processor(repo_id=hf_repo_id)
+
+        # Create processor with vision config if it's a vision model
+        if selected_model_generation == "Qwen2.5-VL":
+            from model.vision import VisionConfig
+
+            vision_config = VisionConfig(
+                n_embed=model.config.vision_config.n_embed,
+                n_layer=model.config.vision_config.n_layer,
+                n_heads=model.config.vision_config.n_heads,
+                output_n_embed=model.config.n_embed,
+                in_channels=model.config.vision_config.in_channels,
+                spatial_merge_size=model.config.vision_config.spatial_merge_size,
+                spatial_patch_size=model.config.vision_config.spatial_patch_size,
+                temporal_patch_size=model.config.vision_config.temporal_patch_size,
+                intermediate_size=getattr(
+                    model.config.vision_config, "intermediate_size", None
+                ),
+                hidden_act=getattr(
+                    model.config.vision_config, "hidden_act", "quick_gelu"
+                ),
+            )
+            processor = Processor(repo_id=hf_repo_id, vision_config=vision_config)
+        else:
+            processor = Processor(repo_id=hf_repo_id)
         if not model or not processor:
             console.print("Failed to load model. Exiting...", style="red")
             return
@@ -257,29 +299,30 @@ def main():
             elif not user_input:
                 continue
 
-            # Parse message for images
-            parsed_content = parse_message_with_images(user_input)
-            messages.append({"role": "user", "content": parsed_content})
-            
+            # Parse user input to messages format
+            current_messages = parse_user_input(user_input)
+            messages.extend(current_messages)
+
             try:
-                with client.messages.stream(
-                    model="claude-sonnet-4-20250514",
-                    messages=messages,
-                    max_tokens=1024,
-                ) as stream:
-                    assistant_response = ""
-                    for text in stream.text_stream:
-                        print(text, end="", flush=True)
-                        assistant_response += text
-                    print()
-                    
-                # Add assistant's response to messages
-                messages.append({"role": "assistant", "content": assistant_response})
-                
+                # Generate response using local model
+                response = generate_local_response(
+                    current_messages,
+                    model,
+                    processor,
+                    selected_model_generation,
+                    max_tokens=128,
+                )
+
+                print(response)
+
+                # Add assistant's response to conversation
+                messages.append({"role": "assistant", "content": response})
+
             except Exception as e:
                 console.print(f"Error generating response: {e}", style="red")
                 # Remove the failed user message
-                messages.pop()
+                if messages and messages[-1]["role"] == "user":
+                    messages.pop()
 
     except KeyboardInterrupt:
         console.print("\nGoodbye!")
