@@ -40,6 +40,7 @@ def _convert_llm_config(hf_config: dict):
         "vocab_size": "vocab_size",
         "rope_theta": "rope_theta",
         "tie_word_embeddings": "tie_word_embeddings",
+        "head_dim": "head_dim",
     }
     return _rename_dict_keys(
         original_dict=hf_config,
@@ -127,6 +128,7 @@ def load_pretrained_model(
 
     llm_config = _convert_llm_config(config_data)
     llm_config = _filter_dict_by_dataclass(llm_config, ModelConfig)
+        
     model_config = ModelConfig(**llm_config)
     if "vision_config" in config_data:
         vision_config = _convert_vision_config(config_data)
@@ -153,8 +155,34 @@ def load_pretrained_model(
                 "VisionRotaryEmbedding"
             ],
         )
+    elif model_cls.__name__ == "Qwen3MoE":
+        # MoE models - use init_empty_weights but with special handling
+        with init_empty_weights():
+            model = model_cls(model_config)
+        try:
+            model = load_checkpoint_and_dispatch(
+                model,
+                model_path,
+                device_map=device_map,
+                dtype=torch.bfloat16,
+                no_split_module_classes=["Block", "Qwen3Block"],
+            )
+        except NotImplementedError as e:
+            if "Cannot copy out of meta tensor" in str(e):
+                print("Meta tensor issue detected, trying alternative loading...")
+                # Fallback: create model normally and let it OOM if needed
+                model = model_cls(model_config)
+                model = load_checkpoint_and_dispatch(
+                    model,
+                    model_path,
+                    device_map=device_map,
+                    dtype=torch.bfloat16,
+                    no_split_module_classes=["Block", "Qwen3Block"],
+                )
+            else:
+                raise
     else:
-        # Text-only models - can use init_empty_weights
+        # Dense text-only models - can use init_empty_weights
         with init_empty_weights():
             model = model_cls(model_config)
         model = load_checkpoint_and_dispatch(
@@ -162,7 +190,7 @@ def load_pretrained_model(
             model_path,
             device_map=device_map,
             dtype=torch.bfloat16,
-            no_split_module_classes=["Block"],
+            no_split_module_classes=["Block", "Qwen3Block"],
         )
 
     return model
