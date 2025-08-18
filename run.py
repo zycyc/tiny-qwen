@@ -135,24 +135,6 @@ def parse_user_input(text):
     return [{"role": "user", "content": content}]
 
 
-def extract_images_from_messages(messages):
-    """Extract PIL images from messages (like process_vision_info)."""
-    images = []
-    for message in messages:
-        content = message.get("content", [])
-        if isinstance(content, str):
-            continue
-        for item in content:
-            if item.get("type") == "image":
-                image_path = item["image"]
-                try:
-                    pil_image = Image.open(image_path)
-                    images.append(pil_image)
-                except Exception as e:
-                    console.print(f"Error loading {image_path}: {e}", style="red")
-    return images
-
-
 def generate_local_response(
     messages, model, processor, model_generation, max_tokens=128
 ):
