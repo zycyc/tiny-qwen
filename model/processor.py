@@ -2,8 +2,8 @@ import torch
 import numpy as np
 from PIL import Image
 from typing import List, Union, Tuple, Optional
-from models.config import VisionConfig
 from tokenizers import Tokenizer
+from .vision import VisionConfig
 
 
 class Processor:
@@ -29,13 +29,17 @@ class Processor:
 
     def __call__(
         self,
-        inputs: List[Union[str, Image.Image]],
+        # inputs: List[Union[str, Image.Image]],
+        messages: List[dict],
         device: Optional[Union[str, torch.device]] = None,
     ) -> dict:
         """
         Process a list of text and/or image inputs.
         If vision_config is None, images are not allowed.
         """
+
+        inputs = self.apply_chat_template(messages)
+
         # Data accumulators
         input_ids = []
         pixels_list = []
@@ -95,6 +99,34 @@ class Processor:
             "pixels": pixels,
             "d_image": d_image,
         }
+
+    def apply_chat_template(self, messages: List[dict]) -> List[Union[str, Image.Image]]:
+        # Simple implementation since tokenizer doesn't have apply_chat_template
+        if isinstance(messages, list) and len(messages) > 0 and isinstance(messages[0], dict):
+            # Standard messages format - convert to our mixed format
+            result = []
+            for message in messages:
+                if message["role"] == "user":
+                    result.append(f"<|im_start|>user\n")
+                    content = message["content"]
+                    if isinstance(content, str):
+                        result.append(content)
+                    elif isinstance(content, list):
+                        for item in content:
+                            if item["type"] == "text":
+                                result.append(item["text"])
+                            elif item["type"] == "image":
+                                result.extend(["<|vision_start|>", Image.open(item["image"]), "<|vision_end|>"])
+                    result.append("<|im_end|>\n")
+                elif message["role"] == "assistant":
+                    result.append(f"<|im_start|>assistant\n{message['content']}<|im_end|>\n")
+            
+            # Add generation prompt
+            result.append("<|im_start|>assistant\n")
+            return result
+        else:
+            # Already in our mixed format, return as-is
+            return messages
 
     def _smart_resize(
         self, height: int, width: int, factor: int = 28

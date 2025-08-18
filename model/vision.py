@@ -2,7 +2,27 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models.config import VisionConfig
+from typing import Optional
+from dataclasses import dataclass
+
+
+@dataclass
+class VisionConfig:
+    """Vision encoder configuration for Qwen2.5-VL"""
+    n_embed: int
+    n_layer: int
+    n_heads: int
+    
+    output_n_embed: int  # same as n_embed of the downstream model/LLM
+
+    in_channels: int
+    spatial_merge_size: int
+    spatial_patch_size: int
+    temporal_patch_size: int
+    
+    # Optional fields for Qwen2.5-VL compatibility
+    intermediate_size: int = None  # For gated MLP
+    hidden_act: str = "quick_gelu"  # Activation function
 
 
 class VisionRotaryEmbedding(nn.Module):
@@ -20,7 +40,7 @@ class VisionRotaryEmbedding(nn.Module):
 
 
 class PatchEmbed(nn.Module):
-    def __init__(self, config: VisionConfig) -> None:
+    def __init__(self, config) -> None:
         super().__init__()
         self.spatial_patch_size = config.spatial_patch_size
         self.temporal_patch_size = config.temporal_patch_size
@@ -56,10 +76,16 @@ class PatchEmbed(nn.Module):
 
 
 class PatchMerger(nn.Module):
-    def __init__(self, dim: int, context_dim: int, spatial_merge_size: int = 2) -> None:
+    def __init__(self, dim: int, context_dim: int, spatial_merge_size: int = 2, config = None) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
-        self.ln_q = nn.LayerNorm(context_dim, eps=1e-6)
+        
+        # Use RMSNorm for Qwen2.5-VL, LayerNorm for Qwen2-VL
+        if config and hasattr(config, 'intermediate_size') and config.intermediate_size is not None:
+            self.ln_q = RMSNorm(context_dim, eps=1e-6)
+        else:
+            self.ln_q = nn.LayerNorm(context_dim, eps=1e-6)
+            
         self.mlp = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size),
             nn.GELU(),
@@ -145,27 +171,82 @@ class VisionAttention(nn.Module):
 
 
 class VisionMlp(nn.Module):
-    def __init__(self, dim: int) -> None:
+    def __init__(self, config) -> None:
         super().__init__()
-        self.fc1 = nn.Linear(dim, 4 * dim)
-        self.fc2 = nn.Linear(4 * dim, dim)
+        dim = config.n_embed
+
+        # Check if this is Qwen2.5-VL (has intermediate_size) or Qwen2-VL
+        if config.intermediate_size is not None:
+            # Qwen2.5-VL: Gated MLP structure
+            self.gate_proj = nn.Linear(dim, config.intermediate_size, bias=True)
+            self.up_proj = nn.Linear(dim, config.intermediate_size, bias=True)
+            self.down_proj = nn.Linear(config.intermediate_size, dim, bias=True)
+            self.act_fn = self._get_activation_fn(config.hidden_act)
+            self.is_gated = True
+        else:
+            # Qwen2-VL: Simple MLP structure
+            self.fc1 = nn.Linear(dim, 4 * dim)
+            self.fc2 = nn.Linear(4 * dim, dim)
+            self.is_gated = False
 
     def forward(self, x) -> torch.Tensor:
-        return self.fc2(self._quick_gelu(self.fc1(x)))
+        # Ensure consistent dtype
+        target_dtype = x.dtype
+
+        if self.is_gated:
+            # Qwen2.5-VL gated MLP
+            gate_out = self.act_fn(self.gate_proj(x.to(target_dtype)))
+            up_out = self.up_proj(x.to(target_dtype))
+            return self.down_proj(gate_out * up_out).to(target_dtype)
+        else:
+            # Qwen2-VL simple MLP
+            return self.fc2(self._quick_gelu(self.fc1(x.to(target_dtype)))).to(
+                target_dtype
+            )
 
     @staticmethod
     def _quick_gelu(x):
         return x * torch.sigmoid(1.702 * x)
 
+    def _get_activation_fn(self, act_name: str):
+        if act_name == "silu":
+            return F.silu
+        elif act_name == "quick_gelu":
+            return self._quick_gelu
+        else:
+            raise ValueError(f"Unsupported activation: {act_name}")
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
 
 class Qwen2VLVisionBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.norm1 = nn.LayerNorm(config.n_embed, eps=1e-6)
-        self.ln_1 = nn.LayerNorm(config.n_embed, eps=1e-6)
+        # Use RMSNorm for Qwen2.5-VL compatibility or LayerNorm for Qwen2-VL
+        if config.intermediate_size is not None:
+            # Qwen2.5-VL uses RMSNorm
+            self.norm1 = RMSNorm(config.n_embed, eps=1e-6)
+            self.norm2 = RMSNorm(config.n_embed, eps=1e-6)
+        else:
+            # Qwen2-VL uses LayerNorm
+            self.norm1 = nn.LayerNorm(config.n_embed, eps=1e-6)
+            self.norm2 = nn.LayerNorm(config.n_embed, eps=1e-6)
+
+        self.ln_1 = nn.LayerNorm(config.n_embed, eps=1e-6)  # Keep for compatibility
         self.attn = VisionAttention(config.n_embed, config.n_heads)
-        self.norm2 = nn.LayerNorm(config.n_embed, eps=1e-6)
-        self.mlp = VisionMlp(config.n_embed)
+        self.mlp = VisionMlp(config)
 
     def forward(self, hidden_states, cu_seqlens, rotary_pos_emb) -> torch.Tensor:
         hidden_states = hidden_states + self.attn(
@@ -188,6 +269,7 @@ class Qwen2VLVisionEncoder(nn.Module):
             dim=config.output_n_embed,
             context_dim=config.n_embed,
             spatial_merge_size=config.spatial_merge_size,
+            config=config,
         )
         head_dim = config.n_embed // config.n_heads
         self.rotary_pos_emb = VisionRotaryEmbedding(head_dim // 2)

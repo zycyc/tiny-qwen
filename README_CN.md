@@ -1,81 +1,106 @@
-[English](README.md) | [中文](README_CN.md)
+<p align="left">
+    中文 | <a href="README.md">English</a>
+</p>
+
+<p align="center">
+    <img src="data/chat.jpg" alt="Tiny Qwen 交互式对话">
+</p>
 
 # ✨ Tiny Qwen
 
-一个简洁易读的 PyTorch 代码库，用于重新实现 Qwen2 和 Qwen2.5（开源多模态大模型）。
+一个简洁易读的 PyTorch 代码库，用于重新实现 `Qwen3` 和 `Qwen2.5-VL`，支持纯文本和图像模态，以及稠密和混合专家架构。
 
-如果你觉得 [Transformers](https://github.com/huggingface/transformers) 代码太庞大难读，那么这个仓库可能更适合你！灵感来源于 [nanoGPT](https://github.com/karpathy/nanoGPT) 和 [litGPT](https://github.com/Lightning-AI/litgpt)，可同时支持纯文本模型（如 Instruct、Coder、Math 等）以及文本 + 图像（VL）。还支持任何全精度的 Qwen2+ 模型，尺寸不限。只需从 [Hugging Face](https://huggingface.co/Qwen) 选择一个 repo id 即可。
+如果你觉得 Hugging Face 代码过于冗长难懂，这个库正适合你！
 
-注意：大于 32B 的模型通常需要多块 GPU。我们会在今后加入 FSDP 支持。如果遇到问题，请随时提 Issue 或提交 PR。
-
-此外，我在找志同道合的人合伙一起构建视觉 AI Agent。如果你对此感兴趣，请随时联系我🤗~ (我的主页在 [这里](https://github.com/Emericen))
-
----
+欢迎大家加我的 [Discord 群](https://discord.gg/sBNnqP9gaY)继续讨论！
 
 ## 🦋 快速开始
 
-推荐先安装带 CUDA 的 PyTorch（见 [官方文档](https://pytorch.org/get-started/locally/)）。然后：
+推荐使用 `uv` 创建虚拟环境：
 
 ```bash
-pip install -r requirements.txt
+pip install uv && uv venv
+
+# 激活环境
+source .venv/bin/activate # Linux/macOS
+.venv\Scripts\activate # Windows
+
+# 安装依赖
+uv pip install -r requirements.txt
 ```
 
-使用示例：
+启动交互式对话：
+
+```bash
+python run.py
+```
+
+**注意：** `Qwen3` 仅支持文本。使用 `@path/to/image.jpg` 为 `Qwen2.5-VL` 引用图片。
+
+```
+USER: @data/test-img-1.jpg 告诉我这张图片里有什么？
+✓ Found image: data/test-img-1.jpg
+ASSISTANT: 这张图片展示了充满活力的向日葵田...
+```
+
+## 📝 代码示例
+
+**运行 `Qwen2.5-VL`：**
 
 ```python
-from models.model import Qwen2, Qwen2VL
-from models.processor import Processor
 from PIL import Image
+from model.model import Qwen2VL
+from model.processor import Processor
 
-# 纯文本模型
-model_name = "Qwen/Qwen2.5-3B"
-model = Qwen2.from_pretrained(repo_id=model_name, device_map="auto")
-processor = Processor(repo_id=model_name)
-
-context = [
-    "<|im_start|>user\nwhat is the meaning of life?<|im_end|>\n<|im_start|>assistant\n"
-]
-inputs = processor(context, device="cuda")
-output = model.generate(input_ids=inputs["input_ids"], max_new_tokens=64)
-output_text = processor.tokenizer.decode(output[0].tolist())
-
-# 文本 + 图像模型
-model_name = "Qwen/Qwen2-VL-2B-Instruct"
+model_name = "Qwen/Qwen2.5-VL-3B-Instruct"
 model = Qwen2VL.from_pretrained(repo_id=model_name, device_map="auto")
-processor = Processor(
-    repo_id=model_name,
-    vision_config=model.config.vision_config,
-)
+processor = Processor(repo_id=model_name, vision_config=model.config.vision_config)
 
 context = [
     "<|im_start|>user\n<|vision_start|>",
-    Image.open("images/test-image.jpeg"),
-    "<|vision_end|>What's on this image?<|im_end|>\n<|im_start|>assistant\n",
+    Image.open("data/test-img-1.jpg"),
+    "<|vision_end|>这张图片里有什么？<|im_end|>\n<|im_start|>assistant\n",
 ]
+
 inputs = processor(context, device="cuda")
-output = model.generate(
+
+generator = model.generate(
     input_ids=inputs["input_ids"],
     pixels=inputs["pixels"],
     d_image=inputs["d_image"],
     max_new_tokens=64,
+    stream=True,
 )
-output_text = processor.tokenizer.decode(output[0].tolist())
+
+for token_id in generator:
+    token_text = processor.tokenizer.decode([token_id])
+    print(token_text, end="", flush=True)
+print()
 ```
 
----
+**运行 `Qwen3`：**
 
-## 🛠️ 微调 / 自定义训练
+```python
+from model.model import Qwen3MoE
+from model.processor import Processor
 
-查看 `train/train_sft.py` 以了解如何简单地对 Qwen 模型进行 SFT（有监督微调）。任意兼容 `torch.nn.Module` 的库都行，此处我用 [PyTorch Lightning](https://lightning.ai/docs/pytorch/stable/index.html) 来做训练。也可以参见 `train/train_mnist.py` 以获取思路。
+model_name = "Qwen/Qwen3-4B-Instruct-2507"
+model = Qwen3MoE.from_pretrained(repo_id=model_name)
+processor = Processor(repo_id=model_name)
 
-运行示例：
+context = [
+    "<|im_start|>user\n<|vision_start|>",
+    "<|vision_end|>解释一下反转链表<|im_end|>\n<|im_start|>assistant\n",
+]
+inputs = processor(context, device="cuda")
+generator = model.generate(
+    input_ids=inputs["input_ids"],
+    max_new_tokens=64,
+    stream=True
+)
 
-```bash
-PYTHONPATH=. python train/train_mnist.py
-```
-
-或
-
-```bash
-PYTHONPATH=. python train/train_sft.py
+for token_id in generator:
+    token_text = processor.tokenizer.decode([token_id])
+    print(token_text, end="", flush=True)
+print()
 ```

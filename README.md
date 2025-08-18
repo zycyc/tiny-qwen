@@ -1,81 +1,106 @@
 <p align="left">
-    &nbspEnglish&nbsp | <a href="README_CN.md">中文</a>
+    English | <a href="README_CN.md">中文</a>
 </p>
 
-# ✨ Tiny Qwen
+<p align="center">
+    <img src="data/chat.jpg" alt="Tiny Qwen Interactive Chat">
+</p>
 
-A minimal, easy-to-read PyTorch re-implementation of Qwen2 and Qwen2.5, the open source multi-modal LLM.
+## ✨ Tiny Qwen
 
-If you find [Transformers](https://github.com/huggingface/transformers) code verbose and challenging to interprete, this repo is for you! Inspired by [nanoGPT](https://github.com/karpathy/nanoGPT) and [litGPT](https://github.com/Lightning-AI/litgpt), it supports text-only versions (Instruct, Coder, Math, etc.) and text+vision versions (VL). It also supports all full prevision Qwen2+ model at any size. Just choose a repo id from Hugging Face Hub [here](https://huggingface.co/Qwen). 
+A minimal, easy-to-read PyTorch re-implementation of `Qwen3` and `Qwen2.5-VL`, supporting both text + vision as well as dense and mixture of experts.
 
-Keep in mind you'll likely need multiple GPU for models bigger than 32B. Stay tuned for FSDP support in the coming days. If you run into any issues, open a PR or create an issue.
+If you find Hugging Face code verbose and challenging to interpret, this repo is for you!
 
-## **Interested in building vision-based AI Agents?**
+Join my [Discord channel](https://discord.gg/sBNnqP9gaY) for more discussion! 
 
-I’m passionate about automating computer use to free up human labor and would love to collaborate with like-minded people. If this sound like you, please don't hesitate to reach out to me 🤗 ([my bio](https://github.com/Emericen))!
+## 🦋 Quick Start
 
-# 🦋 Quick Start
-
-I recommend installing torch with cuda enabled (see [here](https://pytorch.org/get-started/locally/)). After that, simply run:
+I recommend using `uv` and creating a virtual environment:
 
 ```bash
-pip install -r requirements.txt
+pip install uv && uv venv
+
+# activate the environment
+source .venv/bin/activate # Linux/macOS
+.venv\Scripts\activate # Windows
+
+# install dependencies
+uv pip install -r requirements.txt
 ```
 
-You can use the code base like the following:
+Launch the interactive chat:
+
+```bash
+python run.py
+```
+
+**Note:** `Qwen3` is text-only. Use `@path/to/image.jpg` to reference images with `Qwen2.5-VL`.
+
+```
+USER: @data/test-img-1.jpg tell me what you see in this image?
+✓ Found image: data/test-img-1.jpg
+ASSISTANT: The image shows a vibrant sunflower field with a close-up of a sunflower...
+```
+
+## 📝 Code Examples
+
+**Running `Qwen2.5-VL`:**
 
 ```python
-from models.model import Qwen2, Qwen2VL
-from models.processor import Processor
 from PIL import Image
+from model.model import Qwen2VL
+from model.processor import Processor
 
-# text-only models
-model_name = "Qwen/Qwen2.5-3B"
-model = Qwen2.from_pretrained(repo_id=model_name, device_map="auto")
-processor = Processor(repo_id=model_name)
-
-context = [
-    "<|im_start|>user\nwhat is the meaning of life?<|im_end|>\n<|im_start|>assistant\n"
-]
-inputs = processor(context, device="cuda")
-output = model.generate(input_ids=inputs["input_ids"], max_new_tokens=64)
-output_text = processor.tokenizer.decode(output[0].tolist())
-
-# text + vision models
-model_name = "Qwen/Qwen2-VL-2B-Instruct"
+model_name = "Qwen/Qwen2.5-VL-3B-Instruct"
 model = Qwen2VL.from_pretrained(repo_id=model_name, device_map="auto")
-processor = Processor(
-    repo_id=model_name,
-    vision_config=model.config.vision_config,
-)
+processor = Processor(repo_id=model_name, vision_config=model.config.vision_config)
 
 context = [
     "<|im_start|>user\n<|vision_start|>",
-    Image.open("images/test-image.jpeg"),
+    Image.open("data/test-img-1.jpg"),
     "<|vision_end|>What's on this image?<|im_end|>\n<|im_start|>assistant\n",
 ]
+
 inputs = processor(context, device="cuda")
-output = model.generate(
+
+generator = model.generate(
     input_ids=inputs["input_ids"],
     pixels=inputs["pixels"],
     d_image=inputs["d_image"],
     max_new_tokens=64,
+    stream=True,
 )
-output_text = processor.tokenizer.decode(output[0].tolist())
+
+for token_id in generator:
+    token_text = processor.tokenizer.decode([token_id])
+    print(token_text, end="", flush=True)
+print()
 ```
 
-# 🛠️ Fine-tune / Post-train Your Own
+**Running `Qwen3`:**
 
-See `train/train_sft.py` for simple SFT example. Any library compatible with `torch.nn.Module` wourld work, but here I used [PyTorch Lightning](https://lightning.ai/docs/pytorch/stable/index.html) for its flexibility and simplcity. Also see `train/train_mnist.py` for inspiration on how to use this library.
+```python
+from model.model import Qwen3MoE
+from model.processor import Processor
 
-To run any of the training scripts, just run:
+model_name = "Qwen/Qwen3-4B-Instruct-2507"
+model = Qwen3MoE.from_pretrained(repo_id=model_name)
+processor = Processor(repo_id=model_name)
 
-```bash
-PYTHONPATH=. python train/train_mnist.py
-```
+context = [
+    "<|im_start|>user\n<|vision_start|>",
+    "<|vision_end|>Explain reverse linked list<|im_end|>\n<|im_start|>assistant\n",
+]
+inputs = processor(context, device="cuda")
+generator = model.generate(
+    input_ids=inputs["input_ids"],
+    max_new_tokens=64,
+    stream=True
+)
 
-or
-
-```bash
-PYTHONPATH=. python train/train_sft.py
+for token_id in generator:
+    token_text = processor.tokenizer.decode([token_id])
+    print(token_text, end="", flush=True)
+print()
 ```
