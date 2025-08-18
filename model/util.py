@@ -6,6 +6,7 @@ import torch
 from huggingface_hub import snapshot_download, logging
 from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 
+
 from .model import ModelConfig
 from .vision import VisionConfig
 
@@ -52,7 +53,7 @@ def _convert_llm_config(hf_config: dict):
 
 def _convert_vision_config(hf_config: dict):
     vision_config = hf_config["vision_config"]
-    
+
     # Handle different naming conventions between Qwen2-VL and Qwen2.5-VL
     if "embed_dim" in vision_config:
         # Qwen2-VL format
@@ -75,12 +76,12 @@ def _convert_vision_config(hf_config: dict):
             "out_hidden_size": "output_n_embed",
             "in_chans": "in_channels",  # Qwen2.5-VL also uses "in_chans"
             "patch_size": "spatial_patch_size",
-            "temporal_patch_size": "temporal_patch_size", 
+            "temporal_patch_size": "temporal_patch_size",
             "spatial_merge_size": "spatial_merge_size",
             "intermediate_size": "intermediate_size",  # For gated MLP
             "hidden_act": "hidden_act",  # Activation function
         }
-    
+
     return _rename_dict_keys(
         original_dict=vision_config,
         key_mapping=vision_config_key_name_mapping,
@@ -102,12 +103,12 @@ def load_pretrained_model(
 ):
     """
     Load a pretrained model using the same logic as the mixin, but as a standalone function.
-    
+
     Args:
         model_cls: The model class (Qwen2VL, Qwen2, etc.)
         repo_id: HuggingFace repo ID or local path
         device_map: Device mapping for multi-GPU
-        
+
     Returns:
         Loaded model instance
     """
@@ -130,7 +131,7 @@ def load_pretrained_model(
 
     llm_config = _convert_llm_config(config_data)
     llm_config = _filter_dict_by_dataclass(llm_config, ModelConfig)
-        
+
     model_config = ModelConfig(**llm_config)
     if "vision_config" in config_data:
         vision_config = _convert_vision_config(config_data)
@@ -154,7 +155,7 @@ def load_pretrained_model(
                 "PatchMerger",
                 "VisionMlp",
                 "VisionAttention",
-                "VisionRotaryEmbedding"
+                "VisionRotaryEmbedding",
             ],
         )
     elif model_cls.__name__ == "Qwen3MoE":

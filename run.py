@@ -8,6 +8,9 @@ from questionary import Choice, Style
 from rich.console import Console
 from rich.text import Text
 
+# Disable HuggingFace progress bars globally
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+
 from model.processor import Processor
 from model.model import Qwen2VL, Qwen3, Qwen3MoE
 
@@ -33,17 +36,11 @@ Available commands:
 /help - Show this help message
 /exit - Exit the application
 
-For vision models, use @path/to/image.jpg to include images in your messages.
+For Qwen2.5-VL, use @relative/path/to/image.jpg to include images in your messages.
 """
 
 # Mapping of all models: generation -> variant -> HF repo id
 ALL_MODELS = {
-    "Qwen2.5-VL": {
-        "Qwen2.5-VL-3B-Instruct": "Qwen/Qwen2.5-VL-3B-Instruct",
-        "Qwen2.5-VL-7B-Instruct": "Qwen/Qwen2.5-VL-7B-Instruct",
-        "Qwen2.5-VL-32B-Instruct": "Qwen/Qwen2.5-VL-32B-Instruct",
-        "Qwen2.5-VL-72B-Instruct": "Qwen/Qwen2.5-VL-72B-Instruct",
-    },
     "Qwen3": {
         "Qwen3-0.6B": "Qwen/Qwen3-0.6B",
         "Qwen3-1.7B": "Qwen/Qwen3-1.7B",
@@ -57,6 +54,12 @@ ALL_MODELS = {
         "Qwen3-4B-Thinking-2507": "Qwen/Qwen3-4B-Thinking-2507",
         "Qwen3-30B-A3B-Thinking-2507": "Qwen/Qwen3-30B-A3B-Thinking-2507",
         "Qwen3-235B-A22B-Thinking-2507": "Qwen/Qwen3-235B-A22B-Thinking-2507",
+    },
+    "Qwen2.5-VL": {
+        "Qwen2.5-VL-3B-Instruct": "Qwen/Qwen2.5-VL-3B-Instruct",
+        "Qwen2.5-VL-7B-Instruct": "Qwen/Qwen2.5-VL-7B-Instruct",
+        "Qwen2.5-VL-32B-Instruct": "Qwen/Qwen2.5-VL-32B-Instruct",
+        "Qwen2.5-VL-72B-Instruct": "Qwen/Qwen2.5-VL-72B-Instruct",
     },
 }
 
@@ -135,7 +138,7 @@ def parse_user_input(text):
 
 
 def generate_local_response(
-    messages, model, processor, model_generation, max_tokens=128
+    messages, model, processor, model_generation, max_tokens=2048, stream=False
 ):
     """Generate response using local model."""
     # Use processor directly - it now handles both message formats
@@ -149,37 +152,52 @@ def generate_local_response(
     if inputs["d_image"] is not None:
         inputs["d_image"] = inputs["d_image"].to(device)
 
+    # Default stop tokens for Qwen models
+    stop_tokens = [151645, 151644, 151643]  # <|im_end|>, <|im_start|>, <|endoftext|>
+
     # Generate
     with torch.no_grad():
         if model_generation == "Qwen2.5-VL":
             if inputs["pixels"] is not None:
                 # Vision model with images
-                output_ids = model.generate(
+                generation = model.generate(
                     input_ids=inputs["input_ids"],
                     pixels=inputs["pixels"],
                     d_image=inputs["d_image"],
                     max_new_tokens=max_tokens,
+                    stop_tokens=stop_tokens,
+                    stream=stream,
                 )
             else:
                 # Vision model, text-only
-                output_ids = model.generate(
+                generation = model.generate(
                     input_ids=inputs["input_ids"],
                     pixels=None,
                     d_image=None,
                     max_new_tokens=max_tokens,
+                    stop_tokens=stop_tokens,
+                    stream=stream,
                 )
         else:
             # Text-only model
-            output_ids = model.generate(
-                input_ids=inputs["input_ids"], max_new_tokens=max_tokens
+            generation = model.generate(
+                input_ids=inputs["input_ids"],
+                max_new_tokens=max_tokens,
+                stop_tokens=stop_tokens,
+                stream=stream,
             )
 
-    # Decode response (skip the input tokens)
-    input_length = inputs["input_ids"].shape[1]
-    response_ids = output_ids[:, input_length:]
-    response = processor.tokenizer.decode(response_ids[0].tolist())
-
-    return response
+    if stream:
+        # Streaming: yield decoded tokens one by one
+        for token_id in generation:
+            token_text = processor.tokenizer.decode([token_id])
+            yield token_text
+    else:
+        # Non-streaming: decode full response
+        input_length = inputs["input_ids"].shape[1]
+        response_ids = generation[:, input_length:]
+        response = processor.tokenizer.decode(response_ids[0].tolist())
+        return response
 
 
 @app.command()
@@ -222,14 +240,20 @@ def main():
             return
 
         hf_repo_id = ALL_MODELS[selected_model_generation][selected_model_variant]
-        console.print(f"\nLoading model: {hf_repo_id}")
+
+        console.print(f"\nLoading model: [bold]{hf_repo_id}[/bold]")
 
         model_class = REPO_ID_TO_MODEL_CLASS.get(hf_repo_id)
         if not model_class:
-            console.print("Invalid model variant", style="red")
+            console.print("Invalid model variant")
             return
 
-        model = model_class.from_pretrained(hf_repo_id)
+        try:
+            model = model_class.from_pretrained(hf_repo_id)
+            console.print("Model loaded successfully!")
+        except Exception as e:
+            console.print(f"Failed to load model: {e}")
+            return
 
         # Create processor with vision config if it's a vision model
         if selected_model_generation == "Qwen2.5-VL":
@@ -254,15 +278,16 @@ def main():
             processor = Processor(repo_id=hf_repo_id, vision_config=vision_config)
         else:
             processor = Processor(repo_id=hf_repo_id)
+
         if not model or not processor:
-            console.print("Failed to load model. Exiting...", style="red")
+            console.print("Failed to initialize processor. Exiting...", style="red")
             return
 
         # Start the interactive chat loop
         messages = []
         while True:
             # Get user input
-            user_input = input("> ").strip()
+            user_input = input("\nUSER: ").strip()
 
             # Handle special commands
             if user_input == "/exit":
@@ -279,16 +304,23 @@ def main():
             messages.extend(current_messages)
 
             try:
-                # Generate response using local model
-                response = generate_local_response(
+                # Generate response using local model with streaming
+                print("ASSISTANT: ", end="", flush=True)
+
+                response_tokens = []
+                for token in generate_local_response(
                     current_messages,
                     model,
                     processor,
                     selected_model_generation,
-                    max_tokens=128,
-                )
+                    stream=True,
+                ):
+                    print(token, end="", flush=True)
+                    response_tokens.append(token)
 
-                print(response)
+                # Complete the response
+                print()  # New line after streaming
+                response = "".join(response_tokens).strip()
 
                 # Add assistant's response to conversation
                 messages.append({"role": "assistant", "content": response})

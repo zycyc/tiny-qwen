@@ -31,7 +31,11 @@ class RotaryEmbedding(nn.Module):
     def __init__(self, config):
         super().__init__()
         # Use explicit head_dim if provided, otherwise calculate
-        d = config.head_dim if config.head_dim is not None else (config.n_embed // config.n_heads)
+        d = (
+            config.head_dim
+            if config.head_dim is not None
+            else (config.n_embed // config.n_heads)
+        )
         t = config.rope_theta
         r = torch.arange(0, d, 2)
         self.inv_freq = 1.0 / (t ** (r / d)).float()
@@ -123,6 +127,7 @@ class CausalSelfAttention(nn.Module):
 
 class Qwen3Attention(nn.Module):
     """Qwen3 attention with q_norm and k_norm layers"""
+
     def __init__(self, config):
         super().__init__()
 
@@ -137,7 +142,7 @@ class Qwen3Attention(nn.Module):
         self.k_proj = nn.Linear(self.n_embed, self.n_kv_embed, bias=False)
         self.v_proj = nn.Linear(self.n_embed, self.n_kv_embed, bias=False)
         self.o_proj = nn.Linear(self.n_embed, self.n_embed, bias=False)
-        
+
         # Qwen3 specific: q_norm and k_norm on head dimension
         self.q_norm = RMSNorm(self.n_embed_per_head, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.n_embed_per_head, eps=config.rms_norm_eps)
@@ -201,21 +206,30 @@ class Qwen3Attention(nn.Module):
 
 class Qwen3MoeAttention(nn.Module):
     """Qwen3 MoE attention with explicit head_dim support"""
+
     def __init__(self, config):
         super().__init__()
 
         self.n_heads = config.n_heads
         self.n_kv_heads = config.n_kv_heads
         self.n_embed = config.n_embed
-        
+
         # Use explicit head_dim if provided, otherwise calculate
-        self.head_dim = config.head_dim if config.head_dim is not None else (config.n_embed // config.n_heads)
-        
+        self.head_dim = (
+            config.head_dim
+            if config.head_dim is not None
+            else (config.n_embed // config.n_heads)
+        )
+
         self.q_proj = nn.Linear(self.n_embed, self.n_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.n_embed, self.n_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.n_embed, self.n_kv_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(
+            self.n_embed, self.n_kv_heads * self.head_dim, bias=False
+        )
+        self.v_proj = nn.Linear(
+            self.n_embed, self.n_kv_heads * self.head_dim, bias=False
+        )
         self.o_proj = nn.Linear(self.n_heads * self.head_dim, self.n_embed, bias=False)
-        
+
         # Qwen3 specific: q_norm and k_norm on head dimension
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -313,9 +327,15 @@ class MoEFeedForward(nn.Module):
         self.experts = nn.ModuleList()
         for _ in range(config.num_experts):
             expert = nn.Module()
-            expert.gate_proj = nn.Linear(config.n_embed, config.moe_intermediate_size, bias=False)
-            expert.up_proj = nn.Linear(config.n_embed, config.moe_intermediate_size, bias=False) 
-            expert.down_proj = nn.Linear(config.moe_intermediate_size, config.n_embed, bias=False)
+            expert.gate_proj = nn.Linear(
+                config.n_embed, config.moe_intermediate_size, bias=False
+            )
+            expert.up_proj = nn.Linear(
+                config.n_embed, config.moe_intermediate_size, bias=False
+            )
+            expert.down_proj = nn.Linear(
+                config.moe_intermediate_size, config.n_embed, bias=False
+            )
             self.experts.append(expert)
 
     def forward(self, x):
@@ -527,14 +547,34 @@ class Qwen2VL(nn.Module):
         pixels: torch.Tensor,
         d_image: torch.Tensor,
         max_new_tokens: int = 1,
-    ) -> torch.Tensor:
+        stop_tokens: list = None,
+        stream: bool = False,
+    ):
+        if stop_tokens is None:
+            stop_tokens = [
+                151645,
+                151644,
+                151643,
+            ]  # <|im_end|>, <|im_start|>, <|endoftext|>
+
         for _ in range(max_new_tokens):
             logits = self.forward(input_ids=input_ids, pixels=pixels, d_image=d_image)
             last_logits = logits[:, -1, :]
             probs = F.softmax(last_logits, dim=-1)
             next_token = probs.argmax(dim=-1, keepdim=True)
             input_ids = torch.cat([input_ids, next_token], dim=1)
-        return input_ids
+
+            # If streaming, yield the new token
+            if stream:
+                yield next_token.item()
+
+            # Check if we hit a stop token
+            if next_token.item() in stop_tokens:
+                break
+
+        # If not streaming, return the full input_ids
+        if not stream:
+            return input_ids
 
     @classmethod
     def from_pretrained(cls, repo_id: str, device_map: str = "auto"):
@@ -571,15 +611,37 @@ class Qwen2(nn.Module):
         return logits
 
     def generate(
-        self, input_ids: torch.Tensor, max_new_tokens: int = 1
-    ) -> torch.Tensor:
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 1,
+        stop_tokens: list = None,
+        stream: bool = False,
+    ):
+        if stop_tokens is None:
+            stop_tokens = [
+                151645,
+                151644,
+                151643,
+            ]  # <|im_end|>, <|im_start|>, <|endoftext|>
+
         for _ in range(max_new_tokens):
             logits = self.forward(input_ids=input_ids)
             last_logits = logits[:, -1, :]
             probs = F.softmax(last_logits, dim=-1)
             next_token = probs.argmax(dim=-1, keepdim=True)
             input_ids = torch.cat([input_ids, next_token], dim=1)
-        return input_ids
+
+            # If streaming, yield the new token
+            if stream:
+                yield next_token.item()
+
+            # Check if we hit a stop token
+            if next_token.item() in stop_tokens:
+                break
+
+        # If not streaming, return the full input_ids
+        if not stream:
+            return input_ids
 
     @classmethod
     def from_pretrained(cls, repo_id: str, device_map: str = "auto"):
@@ -620,7 +682,9 @@ class Qwen3MoeModel(nn.Module):
         self.rotary_emb = RotaryEmbedding(config)
 
         # Use Qwen3MoeBlock with proper attention and MoE
-        self.layers = nn.ModuleList(Qwen3MoeBlock(config) for _ in range(config.n_layer))
+        self.layers = nn.ModuleList(
+            Qwen3MoeBlock(config) for _ in range(config.n_layer)
+        )
         self.norm = RMSNorm(config.n_embed, eps=config.rms_norm_eps)
 
         # Store config for convenience
@@ -665,8 +729,19 @@ class Qwen3(nn.Module):
         return logits
 
     def generate(
-        self, input_ids: torch.Tensor, max_new_tokens: int = 1
-    ) -> torch.Tensor:
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 1,
+        stop_tokens: list = None,
+        stream: bool = False,
+    ):
+        if stop_tokens is None:
+            stop_tokens = [
+                151645,
+                151644,
+                151643,
+            ]  # <|im_end|>, <|im_start|>, <|endoftext|>
+
         self.eval()
         with torch.no_grad():
             for _ in range(max_new_tokens):
@@ -675,7 +750,18 @@ class Qwen3(nn.Module):
                 probs = F.softmax(last_logits, dim=-1)
                 next_token = probs.argmax(dim=-1, keepdim=True)
                 input_ids = torch.cat([input_ids, next_token], dim=1)
-        return input_ids
+
+                # If streaming, yield the new token
+                if stream:
+                    yield next_token.item()
+
+                # Check if we hit a stop token
+                if next_token.item() in stop_tokens:
+                    break
+
+        # If not streaming, return the full input_ids
+        if not stream:
+            return input_ids
 
     @classmethod
     def from_pretrained(cls, repo_id: str, device_map: str = "auto"):
@@ -715,8 +801,19 @@ class Qwen3MoE(nn.Module):
         return logits
 
     def generate(
-        self, input_ids: torch.Tensor, max_new_tokens: int = 1
-    ) -> torch.Tensor:
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 1,
+        stop_tokens: list = None,
+        stream: bool = False,
+    ):
+        if stop_tokens is None:
+            stop_tokens = [
+                151645,
+                151644,
+                151643,
+            ]  # <|im_end|>, <|im_start|>, <|endoftext|>
+
         self.eval()
         with torch.no_grad():
             for _ in range(max_new_tokens):
@@ -725,7 +822,18 @@ class Qwen3MoE(nn.Module):
                 probs = F.softmax(last_logits, dim=-1)
                 next_token = probs.argmax(dim=-1, keepdim=True)
                 input_ids = torch.cat([input_ids, next_token], dim=1)
-        return input_ids
+
+                # If streaming, yield the new token
+                if stream:
+                    yield next_token.item()
+
+                # Check if we hit a stop token
+                if next_token.item() in stop_tokens:
+                    break
+
+        # If not streaming, return the full input_ids
+        if not stream:
+            return input_ids
 
     @classmethod
     def from_pretrained(cls, repo_id: str, device_map: str = "auto"):
