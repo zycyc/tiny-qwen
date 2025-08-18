@@ -1,6 +1,5 @@
 import os
 import re
-from PIL import Image
 import torch
 
 import typer
