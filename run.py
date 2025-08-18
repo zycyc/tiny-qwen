@@ -24,7 +24,7 @@ ASCII_LOGO = """
 """
 
 STARTING_HELP_TEXT = """
-Welcome to Tiny-Qwen Interactive Chat!
+Welcome to Tiny-Qwen Interactive Interface!
 
 Tips:
 1. /help for more information.
@@ -37,6 +37,15 @@ Available commands:
 /exit - Exit the application
 
 For Qwen2.5-VL, use @relative/path/to/image.jpg to include images in your messages.
+"""
+
+COMPLETION_HELP_TEXT = """
+Available commands:
+/help - Show this help message
+/exit - Exit the application
+
+You're using a base model for text completion.
+Type any text and the model will continue it.
 """
 
 # Mapping of all models: generation -> variant -> HF repo id
@@ -54,6 +63,14 @@ ALL_MODELS = {
         "Qwen3-4B-Thinking-2507": "Qwen/Qwen3-4B-Thinking-2507",
         "Qwen3-30B-A3B-Thinking-2507": "Qwen/Qwen3-30B-A3B-Thinking-2507",
         "Qwen3-235B-A22B-Thinking-2507": "Qwen/Qwen3-235B-A22B-Thinking-2507",
+    },
+    "Qwen3-Base": {
+        "Qwen3-0.6B-Base": "Qwen/Qwen3-0.6B-Base",
+        "Qwen3-1.7B-Base": "Qwen/Qwen3-1.7B-Base",
+        "Qwen3-4B-Base": "Qwen/Qwen3-4B-Base",
+        "Qwen3-8B-Base": "Qwen/Qwen3-8B-Base",
+        "Qwen3-14B-Base": "Qwen/Qwen3-14B-Base",
+        "Qwen3-32B-Base": "Qwen/Qwen3-32B-Base",
     },
     "Qwen2.5-VL": {
         "Qwen2.5-VL-3B-Instruct": "Qwen/Qwen2.5-VL-3B-Instruct",
@@ -80,6 +97,13 @@ REPO_ID_TO_MODEL_CLASS = {
     "Qwen/Qwen3-4B-Thinking-2507": Qwen3MoE,
     "Qwen/Qwen3-30B-A3B-Thinking-2507": Qwen3MoE,
     "Qwen/Qwen3-235B-A22B-Thinking-2507": Qwen3MoE,
+    # Base models
+    "Qwen/Qwen3-0.6B-Base": Qwen3,
+    "Qwen/Qwen3-1.7B-Base": Qwen3,
+    "Qwen/Qwen3-4B-Base": Qwen3,
+    "Qwen/Qwen3-8B-Base": Qwen3,
+    "Qwen/Qwen3-14B-Base": Qwen3,
+    "Qwen/Qwen3-32B-Base": Qwen3,
 }
 
 STYLE = Style(
@@ -96,6 +120,11 @@ STYLE = Style(
 
 console = Console(highlight=False)
 app = typer.Typer(add_completion=False)
+
+
+def is_base_model(repo_id: str) -> bool:
+    """Check if a model is a base model (for completion) vs instruct/chat model."""
+    return "Base" in repo_id
 
 
 def parse_user_input(text):
@@ -138,11 +167,33 @@ def parse_user_input(text):
 
 
 def generate_local_response(
-    messages, model, processor, model_generation, max_tokens=2048, stream=False
+    messages,
+    model,
+    processor,
+    model_generation,
+    max_tokens=2048,
+    stream=False,
+    is_base=False,
 ):
     """Generate response using local model."""
-    # Use processor directly - it now handles both message formats
-    inputs = processor(messages)
+    # For base models, handle raw text input
+    if is_base:
+        if isinstance(messages, str):
+            # Direct text input for base models
+            input_ids = torch.tensor(
+                [processor.tokenizer.encode(messages).ids], dtype=torch.long
+            )
+            inputs = {
+                "input_ids": input_ids,
+                "pixels": None,
+                "d_image": None,
+            }
+        else:
+            # Should not happen for base models
+            raise ValueError("Base models expect string input, not messages")
+    else:
+        # Use processor directly - it now handles both message formats
+        inputs = processor(messages)
 
     # Move inputs to same device as model
     device = next(model.parameters()).device
@@ -202,7 +253,6 @@ def generate_local_response(
 
 @app.command()
 def main():
-
     try:
         # Clear the terminal
         os.system("cls" if os.name == "nt" else "clear")
@@ -283,53 +333,108 @@ def main():
             console.print("Failed to initialize processor. Exiting...", style="red")
             return
 
-        # Start the interactive chat loop
-        messages = []
-        while True:
-            # Get user input
-            user_input = input("\nUSER: ").strip()
+        # Check if this is a base model
+        is_base = is_base_model(hf_repo_id)
 
-            # Handle special commands
-            if user_input == "/exit":
-                console.print("Goodbye!")
-                break
-            elif user_input == "/help":
-                console.print(HELP_TEXT)
-                continue
-            elif not user_input:
-                continue
+        if is_base:
+            # Completion mode for base models
+            console.print(
+                "\n[bold yellow]Running in completion mode (base model)[/bold yellow]"
+            )
+            console.print(
+                "Type text and the model will complete it. Use /exit to quit.\n"
+            )
 
-            # Parse user input to messages format
-            current_messages = parse_user_input(user_input)
-            messages.extend(current_messages)
+            while True:
+                # Get user input
+                user_input = input("\nINPUT: ").strip()
 
-            try:
-                # Generate response using local model with streaming
-                print("ASSISTANT: ", end="", flush=True)
+                # Handle special commands
+                if user_input == "/exit":
+                    console.print("Goodbye!")
+                    break
+                elif user_input == "/help":
+                    console.print(COMPLETION_HELP_TEXT)
+                    continue
+                elif not user_input:
+                    continue
 
-                response_tokens = []
-                for token in generate_local_response(
-                    current_messages,
-                    model,
-                    processor,
-                    selected_model_generation,
-                    stream=True,
-                ):
-                    print(token, end="", flush=True)
-                    response_tokens.append(token)
+                try:
+                    # Generate completion with streaming
+                    print("COMPLETION: ", end="", flush=True)
 
-                # Complete the response
-                print()  # New line after streaming
-                response = "".join(response_tokens).strip()
+                    response_tokens = []
+                    for token in generate_local_response(
+                        user_input,  # Pass raw text for base models
+                        model,
+                        processor,
+                        selected_model_generation,
+                        max_tokens=1 * 1024,  # Shorter completions for base models
+                        stream=True,
+                        is_base=True,
+                    ):
+                        print(token, end="", flush=True)
+                        response_tokens.append(token)
 
-                # Add assistant's response to conversation
-                messages.append({"role": "assistant", "content": response})
+                    # Complete the response
+                    print()  # New line after streaming
 
-            except Exception as e:
-                console.print(f"Error generating response: {e}", style="red")
-                # Remove the failed user message
-                if messages and messages[-1]["role"] == "user":
-                    messages.pop()
+                except Exception as e:
+                    console.print(f"Error generating completion: {e}", style="red")
+        else:
+            # Chat mode for instruct/chat models
+            console.print(
+                "\n[bold cyan]Running in chat mode (instruct model)[/bold cyan]"
+            )
+            console.print("Have a conversation with the model. Use /exit to quit.\n")
+
+            messages = []
+            while True:
+                # Get user input
+                user_input = input("\nUSER: ").strip()
+
+                # Handle special commands
+                if user_input == "/exit":
+                    console.print("Goodbye!")
+                    break
+                elif user_input == "/help":
+                    console.print(HELP_TEXT)
+                    continue
+                elif not user_input:
+                    continue
+
+                # Parse user input to messages format
+                current_messages = parse_user_input(user_input)
+                messages.extend(current_messages)
+
+                try:
+                    # Generate response using local model with streaming
+                    print("ASSISTANT: ", end="", flush=True)
+
+                    response_tokens = []
+                    for token in generate_local_response(
+                        current_messages,
+                        model,
+                        processor,
+                        selected_model_generation,
+                        stream=True,
+                        is_base=False,
+                    ):
+                        print(token, end="", flush=True)
+                        response_tokens.append(token)
+
+                    # Complete the response
+                    print()  # New line after streaming
+                    response = "".join(response_tokens).strip()
+
+                    # Add assistant's response to conversation
+                    messages.append({"role": "assistant", "content": response})
+
+                except Exception as e:
+                    console.print(f"Error generating response: {e}", style="red")
+                    # Remove the failed user message
+                    if messages and messages[-1]["role"] == "user":
+                        messages.pop()
 
     except KeyboardInterrupt:
         console.print("\nGoodbye!")
