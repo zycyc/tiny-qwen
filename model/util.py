@@ -132,6 +132,8 @@ def load_pretrained_model(
     llm_config = _convert_llm_config(config_data)
     llm_config = _filter_dict_by_dataclass(llm_config, ModelConfig)
 
+    print("llm_config: ", llm_config)
+
     model_config = ModelConfig(**llm_config)
     if "vision_config" in config_data:
         vision_config = _convert_vision_config(config_data)

@@ -9,17 +9,21 @@ from .vision import Qwen2VLVisionEncoder, VisionConfig
 
 @dataclass
 class ModelConfig:
-    n_embed: int
-    n_heads: int
-    n_kv_heads: int
-    n_layer: int
-    n_mlp: int
-    rope_theta: float
-    rms_norm_eps: float
-    vocab_size: int
-    tie_word_embeddings: bool
+    # llm_config (Qwen3-1.7B-Base):  {'head_dim': 128, 'n_embed': 2048, 'n_mlp': 6144, 'n_heads': 16, 'n_layer': 28, 'n_kv_heads': 8, 'rms_norm_eps': 1e-06, 'rope_theta': 1000000, 'tie_word_embeddings': True, 'vocab_size': 151936}
+    # llm_config (Qwen3-14B-Base): {'head_dim': 128, 'n_embed': 5120, 'n_mlp': 17408, 'n_heads': 40, 'n_layer': 40, 'n_kv_heads': 8, 'rms_norm_eps': 1e-06, 'rope_theta': 1000000, 'tie_word_embeddings': False, 'vocab_size': 151936}
+    n_embed: int  # example embedding size: 2048
+    n_heads: int  # example number of heads: 16
+    n_kv_heads: int  # example number of key/value heads: 8
+    n_layer: int  # example number of layers: 28
+    n_mlp: int  # example MLP size: 6144
+    rope_theta: float  # example RoPE theta: 1000000
+    rms_norm_eps: float  # example RMSNorm epsilon: 1e-06
+    vocab_size: int  # example vocabulary size: 151936
+    tie_word_embeddings: (
+        bool  # example tie word embeddings: True in 1.7B-Base, False in 14B-Base
+    )
     vision_config: Optional[VisionConfig] = None
-    head_dim: Optional[int] = None  # Explicit head dimension
+    head_dim: Optional[int] = None  # example head dimension: 128
 
     # MoE parameters
     num_experts: Optional[int] = None
@@ -133,19 +137,27 @@ class Qwen3Attention(nn.Module):
 
         self.n_heads = config.n_heads
         self.n_kv_heads = config.n_kv_heads
-
         self.n_embed = config.n_embed
-        self.n_embed_per_head = config.n_embed // config.n_heads
-        self.n_kv_embed = config.n_kv_heads * self.n_embed_per_head
 
-        self.q_proj = nn.Linear(self.n_embed, self.n_embed, bias=False)
-        self.k_proj = nn.Linear(self.n_embed, self.n_kv_embed, bias=False)
-        self.v_proj = nn.Linear(self.n_embed, self.n_kv_embed, bias=False)
-        self.o_proj = nn.Linear(self.n_embed, self.n_embed, bias=False)
+        # Use explicit head_dim from config if provided, otherwise calculate
+        self.head_dim = (
+            config.head_dim
+            if config.head_dim is not None
+            else (config.n_embed // config.n_heads)
+        )
 
-        # Qwen3 specific: q_norm and k_norm on head dimension
-        self.q_norm = RMSNorm(self.n_embed_per_head, eps=config.rms_norm_eps)
-        self.k_norm = RMSNorm(self.n_embed_per_head, eps=config.rms_norm_eps)
+        # Calculate dimensions using explicit head_dim
+        self.q_embed = self.n_heads * self.head_dim
+        self.kv_embed = self.n_kv_heads * self.head_dim
+
+        self.q_proj = nn.Linear(self.n_embed, self.q_embed, bias=False)
+        self.k_proj = nn.Linear(self.n_embed, self.kv_embed, bias=False)
+        self.v_proj = nn.Linear(self.n_embed, self.kv_embed, bias=False)
+        self.o_proj = nn.Linear(self.q_embed, self.n_embed, bias=False)
+
+        # Qwen3 specific: q_norm and k_norm use explicit head_dim
+        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
     def forward(self, x, cos, sin):
         B, T, C = x.size()
@@ -154,9 +166,9 @@ class Qwen3Attention(nn.Module):
         k = self.k_proj(x)
         v = self.v_proj(x)
 
-        q = q.view(B, T, self.n_heads, self.n_embed_per_head).transpose(1, 2)
-        k = k.view(B, T, self.n_kv_heads, self.n_embed_per_head).transpose(1, 2)
-        v = v.view(B, T, self.n_kv_heads, self.n_embed_per_head).transpose(1, 2)
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
         # Apply normalization to q and k before RoPE (Qwen3 specific)
         q = self.q_norm(q.transpose(1, 2)).transpose(1, 2)
@@ -170,7 +182,7 @@ class Qwen3Attention(nn.Module):
             v = v.repeat_interleave(num_repeat, dim=1)
 
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = y.transpose(1, 2).contiguous().view(B, T, self.q_embed)
         y = self.o_proj(y)
         return y
 
