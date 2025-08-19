@@ -11,19 +11,17 @@ from .vision import Qwen2VLVisionEncoder, VisionConfig
 class ModelConfig:
     # llm_config (Qwen3-1.7B-Base):  {'head_dim': 128, 'n_embed': 2048, 'n_mlp': 6144, 'n_heads': 16, 'n_layer': 28, 'n_kv_heads': 8, 'rms_norm_eps': 1e-06, 'rope_theta': 1000000, 'tie_word_embeddings': True, 'vocab_size': 151936}
     # llm_config (Qwen3-14B-Base): {'head_dim': 128, 'n_embed': 5120, 'n_mlp': 17408, 'n_heads': 40, 'n_layer': 40, 'n_kv_heads': 8, 'rms_norm_eps': 1e-06, 'rope_theta': 1000000, 'tie_word_embeddings': False, 'vocab_size': 151936}
-    n_embed: int  # example embedding size: 2048
-    n_heads: int  # example number of heads: 16
-    n_kv_heads: int  # example number of key/value heads: 8
-    n_layer: int  # example number of layers: 28
-    n_mlp: int  # example MLP size: 6144
-    rope_theta: float  # example RoPE theta: 1000000
-    rms_norm_eps: float  # example RMSNorm epsilon: 1e-06
+    n_embed: int  # example embedding size: 2048 (d_model)
+    n_heads: int  # example number of heads: 16 (H)
+    n_kv_heads: int  # example number of key/value heads: 8 (H_kv)
+    n_layer: int  # example number of layers: 28 (L)
+    n_mlp: int  # example MLP size: 6144 (d_ff)
+    rope_theta: float  # example RoPE theta: 1000000 (theta)
+    rms_norm_eps: float  # example RMSNorm epsilon: 1e-06 (eps)
     vocab_size: int  # example vocabulary size: 151936
-    tie_word_embeddings: (
-        bool  # example tie word embeddings: True in 1.7B-Base, False in 14B-Base
-    )
+    tie_word_embeddings: bool  # example tie word embeddings: True in 1.7B-Base, False in 14B-Base (tie_word_embeddings)
     vision_config: Optional[VisionConfig] = None
-    head_dim: Optional[int] = None  # example head dimension: 128
+    head_dim: Optional[int] = None  # example head dimension: 128 (d_h)
 
     # MoE parameters
     num_experts: Optional[int] = None
@@ -52,8 +50,8 @@ class RotaryEmbedding(nn.Module):
         else:
             inv_freq = self.inv_freq.to(x.device)
 
-        position_ids = position_ids.unsqueeze(-1)
-        freqs = position_ids * inv_freq
+        position_ids = position_ids.unsqueeze(-1)  # (B, T, 1), in inference, T is 1
+        freqs = position_ids * inv_freq  # (B, T, 1) * (64) = (B, T, 64)
         emb = torch.cat([freqs, freqs], dim=-1)
         cos = emb.cos().to(x.dtype)
         sin = emb.sin().to(x.dtype)
@@ -61,6 +59,8 @@ class RotaryEmbedding(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
+    """Only used in Block, which is used in Qwen2Model. Qwen3 uses Qwen3Attention instead."""
+
     def __init__(self, config):
         super().__init__()
 
@@ -147,8 +147,8 @@ class Qwen3Attention(nn.Module):
         )
 
         # Calculate dimensions using explicit head_dim
-        self.q_embed = self.n_heads * self.head_dim
-        self.kv_embed = self.n_kv_heads * self.head_dim
+        self.q_embed = self.n_heads * self.head_dim  # e.g., 16 * 128 = 2048
+        self.kv_embed = self.n_kv_heads * self.head_dim  # e.g., 8 * 128 = 1024
 
         self.q_proj = nn.Linear(self.n_embed, self.q_embed, bias=False)
         self.k_proj = nn.Linear(self.n_embed, self.kv_embed, bias=False)
@@ -166,9 +166,15 @@ class Qwen3Attention(nn.Module):
         k = self.k_proj(x)
         v = self.v_proj(x)
 
-        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(
+            1, 2
+        )  # e.g., (1, T, 16, 128) -> (1, 16, T, 128)
+        k = k.view(B, T, self.n_kv_heads, self.head_dim).transpose(
+            1, 2
+        )  # e.g., (1, T, 8, 128) -> (1, 8, T, 128)
+        v = v.view(B, T, self.n_kv_heads, self.head_dim).transpose(
+            1, 2
+        )  # e.g., (1, T, 8, 128) -> (1, 8, T, 128)
 
         # Apply normalization to q and k before RoPE (Qwen3 specific)
         q = self.q_norm(q.transpose(1, 2)).transpose(1, 2)
@@ -177,13 +183,20 @@ class Qwen3Attention(nn.Module):
         q, k = self._apply_rotary_pos_emb(q, k, cos, sin)
 
         if self.n_kv_heads < self.n_heads:
-            num_repeat = self.n_heads // self.n_kv_heads
-            k = k.repeat_interleave(num_repeat, dim=1)
-            v = v.repeat_interleave(num_repeat, dim=1)
+            # saves params by repeating k and v twice, increases efficiency -- Grouped-Query Attention (GQA)
+            num_repeat = self.n_heads // self.n_kv_heads  # e.g., 16 // 8 = 2
+            k = k.repeat_interleave(
+                num_repeat, dim=1
+            )  # e.g., (1, 8, T, 128) -> (1, 16, T, 128)
+            v = v.repeat_interleave(
+                num_repeat, dim=1
+            )  # e.g., (1, 8, T, 128) -> (1, 16, T, 128)
 
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        y = y.transpose(1, 2).contiguous().view(B, T, self.q_embed)
-        y = self.o_proj(y)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # (1, 16, T, 128)
+        y = y.transpose(1, 2).contiguous().view(B, T, self.q_embed)  # (1, T, 2048)
+        y = self.o_proj(
+            y
+        )  # (1, T, 2048) -> (1, T, 2048). q_embed -> n_embed back to original embedding size, in this case the same as q embed size
         return y
 
     @staticmethod
@@ -384,6 +397,7 @@ class Block(nn.Module):
         super().__init__()
         n_embed, eps = config.n_embed, config.rms_norm_eps
         self.input_layernorm = RMSNorm(n_embed=n_embed, eps=eps)
+        print("Initializing CausalSelfAttention")
         self.self_attn = CausalSelfAttention(config)
         self.post_attention_layernorm = RMSNorm(n_embed=n_embed, eps=eps)
         self.mlp = MLP(config)
