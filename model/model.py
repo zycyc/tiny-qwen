@@ -201,6 +201,14 @@ class Qwen3Attention(nn.Module):
 
     @staticmethod
     def _apply_rotary_pos_emb(q, k, cos, sin):
+        """
+        math:
+        cos(x+y) = cos(x)cos(y) - sin(x)sin(y)
+        sin(x+y) = sin(x)cos(y) + cos(x)sin(y)
+
+        x_1’ = x_1 * cos - x_2 * sin (the _rotate_half does this to x_2)
+        x_2’ = x_1 * sin + x_2 * cos
+        """
         if cos.dim() == 4:
             # shape [B, 3, T, D] -> multi-modal
             cos = Qwen3Attention._process_rotary_component(cos)
@@ -210,6 +218,7 @@ class Qwen3Attention(nn.Module):
             cos = cos.unsqueeze(1)
             sin = sin.unsqueeze(1)
 
+        # this combines the x_1' and x_2' into a single operation, which is more efficient than doing it separately
         q_embed = (q * cos) + (Qwen3Attention._rotate_half(q) * sin)
         k_embed = (k * cos) + (Qwen3Attention._rotate_half(k) * sin)
         return q_embed, k_embed
@@ -224,6 +233,9 @@ class Qwen3Attention(nn.Module):
 
     @staticmethod
     def _rotate_half(x):
+        """
+        In RoPE, we use pairs to represent (x1, x2), and we conviniently use the first half of the embedding to represent x1, and the second half to represent x2
+        """
         x1 = x[..., : x.shape[-1] // 2]
         x2 = x[..., x.shape[-1] // 2 :]
         return torch.cat((-x2, x1), dim=-1)
@@ -317,6 +329,23 @@ class Qwen3MoeAttention(nn.Module):
 
 
 class RMSNorm(nn.Module):
+    """
+    RMS is Root Mean Square Layer Normalization
+    It's LayerNorm without the mean part
+
+    LayerNorm:
+    y = (x - mean(x)) / sqrt(variance(x) + eps) * weight
+    where variance(x) = mean((x - mean(x))^2)
+
+    RMSNorm:
+    y = x / sqrt(variance_modified(x) + eps) * weight
+    where variance_modified(x) = mean(x^2)
+
+    Note:
+    1. eps is a small constant to avoid division by zero
+    2. weight is a learnable parameter that scales the output for more expressiveness (some dims can be emphasized, others downweighted.)
+    """
+
     def __init__(self, n_embed, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(n_embed))
@@ -325,8 +354,8 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         input_dtype = x.dtype
         x = x.to(torch.float32)
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.variance_epsilon)
+        variance = x.pow(2).mean(-1, keepdim=True)  # variance but without (x - mean(x))
+        x = x * torch.rsqrt(variance + self.variance_epsilon)  # x but not (x - mean(x))
         return self.weight * x.to(input_dtype)
 
 
@@ -338,7 +367,37 @@ class MLP(nn.Module):
         self.down_proj = nn.Linear(config.n_mlp, config.n_embed, bias=False)
 
     def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        """
+        1. Gate projection: Transform input to higher dimension (like expanding your thinking space)
+        2. Up projection: Another transformation to same higher dimension
+        3. SiLU activation: Apply non-linearity to gate (SiLU = x × sigmoid(x))
+        4. Element-wise multiply: Gate × Up (the gate controls what information flows)
+        5. Down projection: Compress back to original dimension
+
+        What Makes This SwiGLU:
+
+        1. The GLU Part (Gated Linear Unit)
+
+        GLU uses a gating mechanism: output = (input × W1) ⊗ σ(input × W2)
+        - One transformation acts as the "gate"
+        - Another provides the "content"
+        - Element-wise multiplication combines them
+
+        2. The Swish/SiLU Part
+
+        Instead of sigmoid (σ) for gating, it uses SiLU (also called Swish):
+        - SiLU(x) = x × sigmoid(x)
+        - It's smoother and performs better than ReLU or regular sigmoid
+
+        3. SwiGLU = Swish + GLU
+
+        Combining these: SwiGLU(x) = (x × W_gate) ⊗ SiLU(x × W_up) = gate * content
+        """
+        gate = self.gate_proj(x)  # x × W_gate (to n_mlp dimension)
+        up = self.up_proj(x)  # x × W_up (to n_mlp dimension)
+        hidden = F.silu(gate) * up
+        output = self.down_proj(hidden)  # Project back to n_embed
+        return output
 
 
 class MoEFeedForward(nn.Module):
@@ -393,11 +452,14 @@ class MoEFeedForward(nn.Module):
 
 
 class Block(nn.Module):
+    """
+    Only used in Qwen2Model. Qwen3 uses Qwen3Block instead.
+    """
+
     def __init__(self, config):
         super().__init__()
         n_embed, eps = config.n_embed, config.rms_norm_eps
         self.input_layernorm = RMSNorm(n_embed=n_embed, eps=eps)
-        print("Initializing CausalSelfAttention")
         self.self_attn = CausalSelfAttention(config)
         self.post_attention_layernorm = RMSNorm(n_embed=n_embed, eps=eps)
         self.mlp = MLP(config)
@@ -429,6 +491,10 @@ class MoEBlock(nn.Module):
 
 
 class Qwen3Block(nn.Module):
+    """
+    Diagram: https://miro.medium.com/v2/resize:fit:4800/format:webp/1*PcjAYwpn_px7U2Io6S4U8A.png
+    """
+
     def __init__(self, config):
         super().__init__()
         n_embed, eps = config.n_embed, config.rms_norm_eps
@@ -444,6 +510,10 @@ class Qwen3Block(nn.Module):
 
 
 class Qwen3MoeBlock(nn.Module):
+    """
+    Diagram: https://miro.medium.com/v2/resize:fit:4800/format:webp/1*PcjAYwpn_px7U2Io6S4U8A.png
+    """
+
     def __init__(self, config):
         super().__init__()
         n_embed, eps = config.n_embed, config.rms_norm_eps
