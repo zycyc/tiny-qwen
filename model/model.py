@@ -1,3 +1,4 @@
+import math
 import time
 import torch
 import torch.nn as nn
@@ -27,6 +28,15 @@ class ModelConfig:
     num_experts: Optional[int] = None
     num_experts_per_tok: Optional[int] = None
     moe_intermediate_size: Optional[int] = None
+
+    # Cortex parameters (continuous expert layer)
+    use_cortex: bool = False
+    cortex_hidden_size: Optional[int] = None
+    cortex_k_ratio: int = 8
+    cortex_use_lateral: bool = False
+    cortex_lateral_steps: int = 0
+    cortex_soft_kwta: bool = True
+    cortex_temperature: float = 1.0
 
 
 class RotaryEmbedding(nn.Module):
@@ -442,13 +452,92 @@ class MoEFeedForward(nn.Module):
 
         for i in range(self.num_experts_per_tok):
             indices = topk_indices[..., i : i + 1]
-            prob = topk_probs[..., i : i + 1]
+            prob = topk_probs[..., i : i + 1].to(gating_probs.dtype)
             gating_probs.scatter_(dim=-1, index=indices, src=prob)
         gating_probs = gating_probs.unsqueeze(-1)  # (b, t, num_experts, 1)
 
         # Weighted sum over experts
         y = (gating_probs * expert_outputs).sum(dim=-2)
         return y
+
+
+class CortexFeedForward(nn.Module):
+    """
+    Continuous expert layer using learned masks instead of discrete experts.
+    Different mask patterns represent different "virtual experts" (attractor states).
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.n_embed = config.n_embed
+        self.hidden_size = (
+            config.cortex_hidden_size or config.moe_intermediate_size or 4096
+        )
+
+        # Ensure perfect square for 2D layout (for optional lateral convolutions)
+        self.square_dim = int(math.ceil(math.sqrt(self.hidden_size)))
+        self.hidden_size = self.square_dim * self.square_dim
+
+        # Sparsity: k active units out of hidden_size
+        self.k = self.hidden_size // config.cortex_k_ratio
+        self.soft_kwta = config.cortex_soft_kwta
+        self.temperature = config.cortex_temperature
+
+        # Gate network: predicts which hidden units to activate
+        self.gate = nn.Linear(self.n_embed, self.hidden_size, bias=False)
+
+        # SwiGLU-style projections
+        self.gate_proj = nn.Linear(self.n_embed, self.hidden_size, bias=False)
+        self.up_proj = nn.Linear(self.n_embed, self.hidden_size, bias=False)
+        self.down_proj = nn.Linear(self.hidden_size, self.n_embed, bias=False)
+
+        # Optional lateral convolutions for attractor dynamics
+        self.use_lateral = config.cortex_use_lateral
+        self.lateral_steps = config.cortex_lateral_steps
+        if self.use_lateral:
+            self.lateral = nn.Conv2d(1, 1, kernel_size=3, padding=1, bias=False)
+            nn.init.constant_(self.lateral.weight, 1.0 / 9.0)
+
+    def forward(self, x):
+        # Compute mask logits from input
+        mask_logits = self.gate(x)
+
+        # Optional lateral refinement
+        if self.use_lateral and self.lateral_steps > 0:
+            mask_logits = self._apply_lateral(mask_logits)
+
+        # Sparsify to get mask
+        # if self.training and self.soft_kwta:
+        if self.soft_kwta:
+            mask = self._soft_kwta(mask_logits)
+        else:
+            mask = self._hard_kwta(mask_logits)
+
+        # SwiGLU with mask
+        hidden = F.silu(self.gate_proj(x)) * self.up_proj(x)
+        hidden = hidden * mask
+        return self.down_proj(hidden)
+
+    def _soft_kwta(self, logits):
+        """Differentiable approximation to k-winner-take-all."""
+        topk_vals, _ = torch.topk(logits, self.k, dim=-1)
+        threshold = topk_vals[..., -1:].detach()
+        return torch.sigmoid((logits - threshold) / self.temperature)
+
+    def _hard_kwta(self, logits):
+        """Hard k-winner-take-all for inference."""
+        topk_idx = torch.topk(logits, self.k, dim=-1).indices
+        mask = torch.zeros_like(logits)
+        mask.scatter_(-1, topk_idx, 1.0)
+        return mask
+
+    def _apply_lateral(self, mask_logits):
+        """Apply lateral convolution for attractor dynamics."""
+        b, seq, h = mask_logits.shape
+        x = mask_logits.view(b * seq, 1, self.square_dim, self.square_dim)
+        for _ in range(self.lateral_steps):
+            x = self.lateral(x)
+        return x.view(b, seq, self.hidden_size)
 
 
 class Block(nn.Module):
@@ -521,8 +610,10 @@ class Qwen3MoeBlock(nn.Module):
         self.self_attn = Qwen3MoeAttention(config)
         self.post_attention_layernorm = RMSNorm(n_embed=n_embed, eps=eps)
 
-        # Use MoE if experts are configured, otherwise regular MLP
-        if config.num_experts and config.num_experts > 0:
+        # Use Cortex, MoE, or regular MLP
+        if getattr(config, "use_cortex", False):
+            self.mlp = CortexFeedForward(config)
+        elif config.num_experts and config.num_experts > 0:
             self.mlp = MoEFeedForward(config)
         else:
             self.mlp = MLP(config)
