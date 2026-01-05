@@ -15,18 +15,18 @@ from huggingface_hub import PyTorchModelHubMixin
 # Model Configurations
 # =============================================================================
 
-# Dense model: Qwen3-0.6B
-QWEN3_0_6B_CONFIG = ModelConfig(
-    n_embed=1024,
-    n_heads=16,
-    n_kv_heads=8,
-    n_layer=28,
-    n_mlp=3072,
+# Dense model: Qwen3
+QWEN3_CONFIG = ModelConfig(
+    n_embed=768,  # was 1024
+    n_heads=12,  # was 16
+    n_kv_heads=4,  # was 8
+    n_layer=12,  # was 28
+    n_mlp=4033,  # was 3072 (or 4034)
     vocab_size=151936,
     rope_theta=1000000,
     rms_norm_eps=1e-6,
-    tie_word_embeddings=True,
-    head_dim=128,
+    tie_word_embeddings=False,  # was True
+    head_dim=64,  # was 128
 )
 
 # MoE model: Small MoE (~600M total, ~200M active)
@@ -63,14 +63,14 @@ QWEN3_CORTEX_SMALL_CONFIG = ModelConfig(
     use_cortex=True,
     cortex_hidden_size=3025,  # 55x55 grid (matches MoE total params)
     cortex_k_ratio=3,  # k=1008 active units (matches MoE's 1024)
-    cortex_soft_kwta=False,
+    cortex_soft_kwta=True,
     cortex_temperature=1.0,
     cortex_use_lateral=False,
     cortex_lateral_steps=0,
 )
 
 MODEL_CONFIGS = {
-    "dense-0.6b": ("dense", QWEN3_0_6B_CONFIG),
+    "dense": ("dense", QWEN3_CONFIG),
     "moe-small": ("moe", QWEN3_MOE_SMALL_CONFIG),
     "cortex-small": ("cortex", QWEN3_CORTEX_SMALL_CONFIG),
 }
