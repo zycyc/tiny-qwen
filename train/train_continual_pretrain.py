@@ -1,0 +1,924 @@
+"""
+Continual Pretraining Script for Catastrophic Forgetting Experiments
+
+This script trains models in two phases:
+- Phase 1 (Part A): Pretrain on wikitext-103-raw-v1
+- Phase 2 (Part B): Continue training on codeparrot/codeparrot-clean
+
+Throughout both phases, validation loss is measured on BOTH datasets
+to quantify catastrophic forgetting.
+
+Usage:
+    python train/train_continual_pretrain.py --model dense
+    python train/train_continual_pretrain.py --model cortex-small
+"""
+
+import argparse
+import torch
+import torch.nn as nn
+import lightning as L
+import matplotlib.pyplot as plt
+from datetime import datetime
+from tokenizers import Tokenizer
+from torch.utils.data import IterableDataset, Dataset, DataLoader
+from datasets import load_dataset
+from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint, Callback
+from model.model import Qwen3, Qwen3MoE, ModelConfig
+
+
+# =============================================================================
+# Dataset Classes for Wikitext and CodeParrot
+# =============================================================================
+
+
+class WikitextDataset(IterableDataset):
+    """
+    Iterable dataset for wikitext-103-raw-v1.
+    """
+
+    def __init__(
+        self,
+        tokenizer: Tokenizer,
+        seq_length: int = 2048,
+        split: str = "train",
+    ):
+        self.tokenizer = tokenizer
+        self.seq_length = seq_length
+
+        # Load wikitext-103-raw-v1 with streaming
+        self.dataset = load_dataset(
+            "Salesforce/wikitext",
+            "wikitext-103-raw-v1",
+            split=split,
+            streaming=True,
+        )
+
+        self.pad_id = tokenizer.token_to_id("<|pad|>")
+        if self.pad_id is None:
+            self.pad_id = tokenizer.token_to_id("<|endoftext|>")
+
+    def __iter__(self):
+        buffer = []
+
+        for example in self.dataset:
+            text = example["text"]
+            if not text.strip():  # Skip empty lines
+                continue
+            tokens = self.tokenizer.encode(text).ids
+            buffer.extend(tokens)
+
+            while len(buffer) >= self.seq_length + 1:
+                chunk = buffer[: self.seq_length + 1]
+                buffer = buffer[self.seq_length :]
+
+                input_ids = torch.tensor(chunk[:-1], dtype=torch.long)
+                labels = torch.tensor(chunk[1:], dtype=torch.long)
+
+                yield {"input_ids": input_ids, "labels": labels}
+
+
+class WikitextMapDataset(Dataset):
+    """
+    Map-style dataset for wikitext-103-raw-v1 validation.
+    Loads a subset into memory for deterministic validation.
+    """
+
+    def __init__(
+        self,
+        tokenizer: Tokenizer,
+        seq_length: int = 2048,
+        split: str = "validation",
+        max_samples: int = 500,
+    ):
+        self.tokenizer = tokenizer
+        self.seq_length = seq_length
+        self.samples = []
+
+        self.pad_id = tokenizer.token_to_id("<|pad|>")
+        if self.pad_id is None:
+            self.pad_id = tokenizer.token_to_id("<|endoftext|>")
+
+        # Load wikitext-103-raw-v1
+        dataset = load_dataset(
+            "Salesforce/wikitext",
+            "wikitext-103-raw-v1",
+            split=split,
+            streaming=True,
+        )
+
+        buffer = []
+        for example in dataset:
+            text = example["text"]
+            if not text.strip():
+                continue
+            tokens = self.tokenizer.encode(text).ids
+            buffer.extend(tokens)
+
+            while len(buffer) >= self.seq_length + 1:
+                chunk = buffer[: self.seq_length + 1]
+                buffer = buffer[self.seq_length :]
+
+                input_ids = torch.tensor(chunk[:-1], dtype=torch.long)
+                labels = torch.tensor(chunk[1:], dtype=torch.long)
+
+                self.samples.append({"input_ids": input_ids, "labels": labels})
+
+                if len(self.samples) >= max_samples:
+                    return
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+
+class CodeParrotDataset(IterableDataset):
+    """
+    Iterable dataset for codeparrot/codeparrot-clean.
+    """
+
+    def __init__(
+        self,
+        tokenizer: Tokenizer,
+        seq_length: int = 2048,
+        split: str = "train",
+    ):
+        self.tokenizer = tokenizer
+        self.seq_length = seq_length
+
+        # Load codeparrot-clean with streaming
+        self.dataset = load_dataset(
+            "codeparrot/codeparrot-clean",
+            split=split,
+            streaming=True,
+        )
+
+        self.pad_id = tokenizer.token_to_id("<|pad|>")
+        if self.pad_id is None:
+            self.pad_id = tokenizer.token_to_id("<|endoftext|>")
+
+    def __iter__(self):
+        buffer = []
+        skipped = 0
+
+        for example in self.dataset:
+            try:
+                text = example["content"]  # codeparrot uses "content" field
+                if not text or not text.strip():
+                    continue
+                tokens = self.tokenizer.encode(text).ids
+                buffer.extend(tokens)
+
+                while len(buffer) >= self.seq_length + 1:
+                    chunk = buffer[: self.seq_length + 1]
+                    buffer = buffer[self.seq_length :]
+
+                    input_ids = torch.tensor(chunk[:-1], dtype=torch.long)
+                    labels = torch.tensor(chunk[1:], dtype=torch.long)
+
+                    yield {"input_ids": input_ids, "labels": labels}
+            except Exception:
+                skipped += 1
+                if skipped % 1000 == 0:
+                    print(f"[CodeParrot] Skipped {skipped} corrupted records")
+                continue
+
+
+class CodeParrotMapDataset(Dataset):
+    """
+    Map-style dataset for codeparrot-clean validation.
+    Loads a subset into memory for deterministic validation.
+    """
+
+    def __init__(
+        self,
+        tokenizer: Tokenizer,
+        seq_length: int = 2048,
+        split: str = "train",  # codeparrot-clean only has train split
+        max_samples: int = 500,
+        skip_examples: int = 0,
+    ):
+        self.tokenizer = tokenizer
+        self.seq_length = seq_length
+        self.samples = []
+
+        self.pad_id = tokenizer.token_to_id("<|pad|>")
+        if self.pad_id is None:
+            self.pad_id = tokenizer.token_to_id("<|endoftext|>")
+
+        # Load codeparrot-clean with streaming
+        dataset = load_dataset(
+            "codeparrot/codeparrot-clean",
+            split=split,
+            streaming=True,
+        )
+
+        # Skip some examples for validation (to not overlap with training start)
+        if skip_examples > 0:
+            dataset = dataset.skip(skip_examples)
+
+        buffer = []
+        for example in dataset:
+            try:
+                text = example["content"]
+                if not text or not text.strip():
+                    continue
+                tokens = self.tokenizer.encode(text).ids
+                buffer.extend(tokens)
+
+                while len(buffer) >= self.seq_length + 1:
+                    chunk = buffer[: self.seq_length + 1]
+                    buffer = buffer[self.seq_length :]
+
+                    input_ids = torch.tensor(chunk[:-1], dtype=torch.long)
+                    labels = torch.tensor(chunk[1:], dtype=torch.long)
+
+                    self.samples.append({"input_ids": input_ids, "labels": labels})
+
+                    if len(self.samples) >= max_samples:
+                        return
+            except Exception:
+                continue
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+
+def collate_fn(batch):
+    """Simple collator that stacks sequences."""
+    return {
+        "input_ids": torch.stack([x["input_ids"] for x in batch]),
+        "labels": torch.stack([x["labels"] for x in batch]),
+    }
+
+
+# =============================================================================
+# Model Configurations (same as train_pretrain.py)
+# =============================================================================
+
+# Dense model: Qwen3 (matched to cortex-small param count)
+# n_mlp = 2 × n_mlp_moe for exact active param matching
+QWEN3_CONFIG = ModelConfig(
+    n_embed=768,
+    n_heads=12,
+    n_kv_heads=4,
+    n_layer=12,
+    n_mlp=4030,  # = 2 × 2015 (n_mlp_moe), so total_dense = active_moe exactly
+    vocab_size=151936,
+    rope_theta=1000000,
+    rms_norm_eps=1e-6,
+    tie_word_embeddings=False,
+    head_dim=64,
+)
+
+# MoE model: Traditional sparse mixture of experts
+# Sized so active params (2 experts) ≈ dense model total params
+# Active per layer: router (6,144) + 2 experts × 3 × 768 × 2015 = 9,291,264
+QWEN3_MOE_SMALL_CONFIG = ModelConfig(
+    n_embed=768,
+    n_heads=12,
+    n_kv_heads=4,
+    n_layer=12,
+    n_mlp=2015,
+    vocab_size=151936,
+    rope_theta=1000000,
+    rms_norm_eps=1e-6,
+    tie_word_embeddings=False,
+    head_dim=64,
+    # MoE parameters
+    num_experts=8,
+    num_experts_per_tok=2,
+    moe_intermediate_size=2015,
+)
+
+# Cortex model: Continuous expert with learned masks
+# Formula: cortex_hidden_size = num_experts_per_tok × n_mlp_moe × k_ratio (active capacity matching)
+# k = 4030 active units = MoE active capacity (2 experts × 2015)
+# Note: Cortex uses ~4× FLOPs vs dense, but matches active capacity for fair interference comparison
+QWEN3_CORTEX_ACTIVE_CONFIG = ModelConfig(
+    n_embed=768,
+    n_heads=12,
+    n_kv_heads=4,
+    n_layer=12,
+    n_mlp=4030,  # = 2 × n_mlp_moe, same as dense for consistency
+    vocab_size=151936,
+    rope_theta=1000000,
+    rms_norm_eps=1e-6,
+    tie_word_embeddings=False,
+    head_dim=64,
+    # Cortex parameters
+    use_cortex=True,
+    cortex_hidden_size=12090,  # k × k_ratio = 4030 × 3 (active capacity matches MoE)
+    cortex_k_ratio=3,
+    cortex_soft_kwta=True,
+    cortex_temperature=1.0,
+    cortex_use_lateral=False,
+    cortex_lateral_steps=0,
+)
+
+# Cortex model: Continuous expert with learned masks
+# Formula: cortex_hidden_size = (3/4) × n_mlp (so cortex_FLOPs = dense_FLOPs)
+# k = H / k_ratio = 1008 active units (33% sparsity)
+QWEN3_CORTEX_FLOPS_CONFIG = ModelConfig(
+    n_embed=768,
+    n_heads=12,
+    n_kv_heads=4,
+    n_layer=12,
+    n_mlp=4033,  # required positional arg, but doesn't matter here
+    vocab_size=151936,
+    rope_theta=1000000,
+    rms_norm_eps=1e-6,
+    tie_word_embeddings=False,
+    head_dim=64,
+    # Cortex parameters
+    use_cortex=True,
+    cortex_hidden_size=3025,  # (3/4) × n_mlp ≈ 3022.5, use 55×55 so cortex_FLOPs = dense_FLOPs
+    cortex_k_ratio=3,
+    cortex_soft_kwta=True,
+    cortex_temperature=1.0,
+    cortex_use_lateral=False,
+    cortex_lateral_steps=0,
+)
+
+MODEL_CONFIGS = {
+    "dense": ("dense", QWEN3_CONFIG),
+    "moe-small": ("moe", QWEN3_MOE_SMALL_CONFIG),
+    "cortex-active": ("cortex", QWEN3_CORTEX_ACTIVE_CONFIG),
+    "cortex-flops": ("cortex", QWEN3_CORTEX_FLOPS_CONFIG),
+}
+
+# =============================================================================
+# Dataset size constants (approximate token counts)
+# =============================================================================
+
+# wikitext-103-raw-v1: ~100 million tokens
+WIKITEXT_TOKENS = 100_000_000
+
+# codeparrot-clean: ~27 billion tokens (conservative estimate)
+CODEPARROT_TOKENS = 27_000_000_000
+
+
+# =============================================================================
+# Training Module with Multi-Validation Support
+# =============================================================================
+
+
+class Qwen3ForContinualPretrain(L.LightningModule):
+    """Lightning module for continual pretraining with multi-chunk validation."""
+
+    def __init__(
+        self,
+        config: ModelConfig,
+        model_type: str = "dense",
+        learning_rate: float = 1e-4,
+    ):
+        super().__init__()
+        self.save_hyperparameters(ignore=["config"])
+        self.config = config
+        self.model_type = model_type
+        self.learning_rate = learning_rate
+
+        # Create model with random weights
+        if model_type == "moe" or model_type == "cortex":
+            self.qwen_model = Qwen3MoE(config)
+        else:
+            self.qwen_model = Qwen3(config)
+
+        self.loss_fct = nn.CrossEntropyLoss()
+
+        # Track losses for plotting
+        self.train_losses = []
+        self.val_losses_part_a = []
+        self.val_losses_part_b = []
+
+        # Current phase (for logging)
+        self.current_phase = 1
+
+    def forward(self, input_ids):
+        return self.qwen_model(input_ids)
+
+    def training_step(self, batch, batch_idx):
+        input_ids = batch["input_ids"]
+        labels = batch["labels"]
+        logits = self(input_ids)
+        loss = self.loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+
+        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=False)
+        self.log("phase", float(self.current_phase), on_step=True, on_epoch=False)
+        self.train_losses.append(loss.detach().cpu())
+        return loss
+
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        input_ids = batch["input_ids"]
+        labels = batch["labels"]
+        logits = self(input_ids)
+        loss = self.loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+
+        # Log with part-specific name (part_a = wikitext, part_b = codeparrot)
+        part_name = ["part_a_wikitext", "part_b_codeparrot"][dataloader_idx]
+        self.log(
+            f"val_loss_{part_name}",
+            loss,
+            prog_bar=True,
+            on_step=False,
+            on_epoch=True,
+            add_dataloader_idx=False,
+        )
+
+        # Track for plotting
+        if dataloader_idx == 0:
+            self.val_losses_part_a.append(loss.detach().cpu())
+        else:
+            self.val_losses_part_b.append(loss.detach().cpu())
+
+        return loss
+
+    def configure_optimizers(self):
+        # Constant LR - no scheduler
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.learning_rate,
+            betas=(0.9, 0.95),
+            weight_decay=0.1,
+        )
+        return optimizer
+
+    def set_phase(self, phase: int):
+        """Set current training phase for logging."""
+        self.current_phase = phase
+
+
+class PhaseMarkerCallback(Callback):
+    """Callback to log phase transitions to wandb."""
+
+    def __init__(self, wandb_logger):
+        self.wandb_logger = wandb_logger
+
+    def on_train_start(self, trainer, pl_module):
+        phase = pl_module.current_phase
+        if self.wandb_logger:
+            self.wandb_logger.experiment.log(
+                {"phase_start": phase, "global_step": trainer.global_step}
+            )
+
+
+def init_weights(module):
+    """Initialize weights for pretraining."""
+    if isinstance(module, nn.Linear):
+        torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        if module.bias is not None:
+            torch.nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Embedding):
+        torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+
+def calculate_steps_for_tokens(
+    tokens: int, batch_size: int, grad_accum: int, seq_length: int
+) -> int:
+    """Calculate number of training steps needed for a given token count."""
+    effective_batch_size = batch_size * grad_accum
+    tokens_per_step = effective_batch_size * seq_length
+    return tokens // tokens_per_step
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Continual pretraining for catastrophic forgetting experiments"
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="dense",
+        choices=list(MODEL_CONFIGS.keys()),
+        help="Model configuration to use",
+    )
+    parser.add_argument(
+        "--phase1-steps",
+        type=int,
+        default=None,
+        help="Training steps for phase 1 (wikitext). Default: full dataset",
+    )
+    parser.add_argument(
+        "--phase2-steps",
+        type=int,
+        default=None,
+        help="Training steps for phase 2 (codeparrot). Default: full dataset",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=4,
+        help="Batch size per GPU (default: 4)",
+    )
+    parser.add_argument(
+        "--seq-length",
+        type=int,
+        default=2048,
+        help="Sequence length (default: 2048)",
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=1e-4,
+        help="Learning rate - constant throughout (default: 1e-4)",
+    )
+    parser.add_argument(
+        "--grad-accum",
+        type=int,
+        default=8,
+        help="Gradient accumulation steps (default: 8)",
+    )
+    parser.add_argument(
+        "--val-samples",
+        type=int,
+        default=500,
+        help="Number of validation samples per dataset (default: 500)",
+    )
+    parser.add_argument(
+        "--val-check-interval",
+        type=int,
+        default=500,
+        help="Validation check interval in steps (default: 500)",
+    )
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default="tiny-qwen-continual",
+        help="Wandb project name",
+    )
+    return parser.parse_args()
+
+
+def create_trainer(
+    phase: int,
+    max_steps: int,
+    model_name: str,
+    wandb_logger: WandbLogger,
+    args,
+    checkpoint_dir: str,
+):
+    """Create a Lightning Trainer for a specific phase."""
+
+    lr_monitor = LearningRateMonitor(logging_interval="step")
+
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=checkpoint_dir,
+        filename=f"{model_name}-phase{phase}"
+        + "-{step:06d}-{val_loss_part_a_wikitext:.4f}",
+        save_top_k=2,
+        monitor="val_loss_part_a_wikitext",
+        mode="min",
+        save_last=True,
+        every_n_train_steps=5000,
+    )
+
+    trainer = L.Trainer(
+        max_steps=max_steps,
+        accelerator="gpu",
+        devices=1,
+        precision="bf16-mixed",
+        gradient_clip_val=1.0,
+        accumulate_grad_batches=args.grad_accum,
+        val_check_interval=args.val_check_interval,
+        log_every_n_steps=10,
+        logger=wandb_logger,
+        callbacks=[lr_monitor, checkpoint_callback],
+        default_root_dir=checkpoint_dir,
+        enable_progress_bar=True,
+    )
+
+    return trainer, checkpoint_callback
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    # Timestamp for unique checkpoint directory
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # Get model config
+    model_type, config = MODEL_CONFIGS[args.model]
+    model_name = args.model
+
+    # Checkpoint directory with timestamp
+    checkpoint_dir = f"cache/checkpoints/continual/{model_name}/{timestamp}"
+
+    # Initialize tokenizer
+    tokenizer = Tokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+    tokenizer.add_special_tokens(["<|pad|>"])
+
+    # Calculate default steps if not specified
+    effective_batch_size = args.batch_size * args.grad_accum
+    tokens_per_step = effective_batch_size * args.seq_length
+
+    phase1_steps = args.phase1_steps
+    if phase1_steps is None:
+        phase1_steps = calculate_steps_for_tokens(
+            WIKITEXT_TOKENS, args.batch_size, args.grad_accum, args.seq_length
+        )
+        print(
+            f"Phase 1 (wikitext-103): Auto-calculated {phase1_steps} steps for ~{WIKITEXT_TOKENS / 1e6:.0f}M tokens"
+        )
+
+    phase2_steps = args.phase2_steps
+    if phase2_steps is None:
+        phase2_steps = calculate_steps_for_tokens(
+            CODEPARROT_TOKENS, args.batch_size, args.grad_accum, args.seq_length
+        )
+        print(
+            f"Phase 2 (codeparrot): Auto-calculated {phase2_steps} steps for ~{CODEPARROT_TOKENS / 1e9:.0f}B tokens"
+        )
+
+    # Create model with random weights
+    print(f"\nInitializing {model_name} ({model_type}) model with random weights...")
+    model = Qwen3ForContinualPretrain(
+        config=config,
+        model_type=model_type,
+        learning_rate=args.lr,
+    )
+
+    # Initialize weights properly
+    model.apply(init_weights)
+
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total parameters: {total_params / 1e6:.2f}M")
+
+    if model_type == "cortex":
+        k = config.cortex_hidden_size // config.cortex_k_ratio
+        print(f"Cortex hidden size: {config.cortex_hidden_size}")
+        print(
+            f"Active units per token: {k} / {config.cortex_hidden_size} ({100 * k / config.cortex_hidden_size:.1f}%)"
+        )
+
+    # ==========================================================================
+    # Create Dataloaders
+    # ==========================================================================
+
+    print("\nLoading datasets...")
+
+    # Training dataloader for Part A (wikitext-103)
+    print("  Loading wikitext-103-raw-v1 training data...")
+    train_dataset_part_a = WikitextDataset(
+        tokenizer=tokenizer,
+        seq_length=args.seq_length,
+        split="train",
+    )
+    train_loader_part_a = DataLoader(
+        train_dataset_part_a,
+        batch_size=args.batch_size,
+        collate_fn=collate_fn,
+        num_workers=0,
+    )
+
+    # Training dataloader for Part B (codeparrot-clean)
+    print("  Loading codeparrot/codeparrot-clean training data...")
+    train_dataset_part_b = CodeParrotDataset(
+        tokenizer=tokenizer,
+        seq_length=args.seq_length,
+        split="train",
+    )
+    train_loader_part_b = DataLoader(
+        train_dataset_part_b,
+        batch_size=args.batch_size,
+        collate_fn=collate_fn,
+        num_workers=0,
+    )
+
+    # Validation dataloaders for both datasets (used in BOTH phases)
+    print(f"  Loading wikitext-103 validation data ({args.val_samples} samples)...")
+    val_dataset_part_a = WikitextMapDataset(
+        tokenizer=tokenizer,
+        seq_length=args.seq_length,
+        split="validation",
+        max_samples=args.val_samples,
+    )
+    val_loader_part_a = DataLoader(
+        val_dataset_part_a,
+        batch_size=args.batch_size,
+        collate_fn=collate_fn,
+        shuffle=False,
+    )
+
+    # For codeparrot, skip some examples for validation to avoid overlap
+    print(f"  Loading codeparrot validation data ({args.val_samples} samples)...")
+    val_dataset_part_b = CodeParrotMapDataset(
+        tokenizer=tokenizer,
+        seq_length=args.seq_length,
+        split="train",  # codeparrot only has train split
+        max_samples=args.val_samples,
+        skip_examples=100000,  # Skip first 100k to use different data for val
+    )
+    val_loader_part_b = DataLoader(
+        val_dataset_part_b,
+        batch_size=args.batch_size,
+        collate_fn=collate_fn,
+        shuffle=False,
+    )
+
+    val_loaders = [val_loader_part_a, val_loader_part_b]
+
+    # ==========================================================================
+    # Configure Wandb Logger (single run for both phases)
+    # ==========================================================================
+
+    wandb_logger = WandbLogger(
+        project=args.wandb_project,
+        name=f"{model_name}-continual-{timestamp}",
+        save_dir="cache/wandb",
+        log_model=False,
+        config={
+            "model": model_name,
+            "model_type": model_type,
+            "experiment": "continual_pretraining_wikitext_codeparrot",
+            "phase1_dataset": "wikitext-103-raw-v1",
+            "phase2_dataset": "codeparrot/codeparrot-clean",
+            "phase1_tokens": WIKITEXT_TOKENS,
+            "phase2_tokens": CODEPARROT_TOKENS,
+            "phase1_steps": phase1_steps,
+            "phase2_steps": phase2_steps,
+            "total_steps": phase1_steps + phase2_steps,
+            "batch_size": args.batch_size,
+            "effective_batch_size": effective_batch_size,
+            "tokens_per_step": tokens_per_step,
+            "seq_length": args.seq_length,
+            "learning_rate": args.lr,
+            "lr_schedule": "constant",
+            "total_params": total_params,
+            "timestamp": timestamp,
+            **(
+                {
+                    "cortex_hidden_size": config.cortex_hidden_size,
+                    "cortex_k_ratio": config.cortex_k_ratio,
+                    "cortex_active_units": config.cortex_hidden_size
+                    // config.cortex_k_ratio,
+                }
+                if model_type == "cortex"
+                else {}
+            ),
+        },
+    )
+
+    # ==========================================================================
+    # Phase 1: Train on wikitext-103 (Part A)
+    # ==========================================================================
+
+    print(f"\n{'=' * 60}")
+    print(f"PHASE 1: Training on wikitext-103-raw-v1 for {phase1_steps} steps")
+    print(f"{'=' * 60}")
+    print(f"Effective batch size: {effective_batch_size}")
+    print(f"Tokens per step: {tokens_per_step:,}")
+    print(f"Checkpoint directory: {checkpoint_dir}")
+
+    model.set_phase(1)
+
+    trainer_phase1, ckpt_callback_phase1 = create_trainer(
+        phase=1,
+        max_steps=phase1_steps,
+        model_name=model_name,
+        wandb_logger=wandb_logger,
+        args=args,
+        checkpoint_dir=checkpoint_dir,
+    )
+
+    # Log phase start
+    wandb_logger.experiment.log({"phase": 1, "phase_event": "start"})
+
+    # Run validation before training to get baseline metrics
+    print("Running initial validation to get baseline metrics...")
+    trainer_phase1.validate(model=model, dataloaders=val_loaders)
+
+    trainer_phase1.fit(
+        model=model,
+        train_dataloaders=train_loader_part_a,
+        val_dataloaders=val_loaders,
+    )
+
+    # Save phase 1 final checkpoint
+    phase1_checkpoint = f"{checkpoint_dir}/{model_name}-phase1-final.ckpt"
+    trainer_phase1.save_checkpoint(phase1_checkpoint)
+    print(f"\nPhase 1 complete. Checkpoint saved: {phase1_checkpoint}")
+
+    # Log phase 1 end metrics
+    wandb_logger.experiment.log({"phase": 1, "phase_event": "end"})
+
+    # ==========================================================================
+    # Phase 2: Continue Training on codeparrot-clean (Part B)
+    # ==========================================================================
+
+    print(f"\n{'=' * 60}")
+    print(f"PHASE 2: Training on codeparrot-clean for {phase2_steps} steps")
+    print(f"{'=' * 60}")
+
+    model.set_phase(2)
+
+    # Create new trainer for phase 2
+    # Note: We continue with the same model state (no reload needed)
+    trainer_phase2, ckpt_callback_phase2 = create_trainer(
+        phase=2,
+        max_steps=phase1_steps + phase2_steps,  # Total steps from start
+        model_name=model_name,
+        wandb_logger=wandb_logger,
+        args=args,
+        checkpoint_dir=checkpoint_dir,
+    )
+
+    # Log phase start
+    wandb_logger.experiment.log({"phase": 2, "phase_event": "start"})
+
+    # Continue training from phase 1 checkpoint
+    trainer_phase2.fit(
+        model=model,
+        train_dataloaders=train_loader_part_b,
+        val_dataloaders=val_loaders,
+        ckpt_path=phase1_checkpoint,
+    )
+
+    # Save phase 2 final checkpoint
+    phase2_checkpoint = f"{checkpoint_dir}/{model_name}-phase2-final.ckpt"
+    trainer_phase2.save_checkpoint(phase2_checkpoint)
+    print(f"\nPhase 2 complete. Checkpoint saved: {phase2_checkpoint}")
+
+    # Log phase 2 end
+    wandb_logger.experiment.log({"phase": 2, "phase_event": "end"})
+
+    # ==========================================================================
+    # Final Summary and Plots
+    # ==========================================================================
+
+    print(f"\n{'=' * 60}")
+    print("TRAINING COMPLETE")
+    print(f"{'=' * 60}")
+    print(f"Model: {model_name}")
+    print(f"Phase 1 (wikitext-103): {phase1_steps} steps")
+    print(f"Phase 2 (codeparrot): {phase2_steps} steps")
+    print(f"Total steps: {phase1_steps + phase2_steps}")
+    print(f"Checkpoints saved in: {checkpoint_dir}")
+
+    # Plot losses
+    if model.train_losses:
+        plt.figure(figsize=(12, 5))
+
+        # Plot training loss
+        plt.subplot(1, 2, 1)
+        train_loss_values = [loss.item() for loss in model.train_losses]
+        plt.plot(train_loss_values, alpha=0.7, label="train_loss")
+        plt.axvline(x=phase1_steps, color="r", linestyle="--", label="Phase 2 start")
+        plt.xlabel("Steps")
+        plt.ylabel("Loss")
+        plt.title("Training Loss")
+        plt.legend()
+
+        # Plot validation losses
+        plt.subplot(1, 2, 2)
+        val_interval = args.val_check_interval
+
+        if model.val_losses_part_a:
+            val_indices = [
+                i * val_interval for i in range(len(model.val_losses_part_a))
+            ]
+            plt.plot(
+                val_indices,
+                [loss.item() for loss in model.val_losses_part_a],
+                label="val_loss_wikitext",
+                marker="o",
+                markersize=3,
+            )
+        if model.val_losses_part_b:
+            val_indices = [
+                i * val_interval for i in range(len(model.val_losses_part_b))
+            ]
+            plt.plot(
+                val_indices,
+                [loss.item() for loss in model.val_losses_part_b],
+                label="val_loss_codeparrot",
+                marker="s",
+                markersize=3,
+            )
+
+        plt.axvline(x=phase1_steps, color="r", linestyle="--", label="Phase 2 start")
+        plt.xlabel("Steps")
+        plt.ylabel("Loss")
+        plt.title("Validation Losses (Forgetting Analysis)")
+        plt.legend()
+
+        plt.tight_layout()
+        plot_path = f"cache/{model_name}_continual_loss_{timestamp}.png"
+        plt.savefig(plot_path)
+        print(f"Loss plot saved: {plot_path}")
+
+        # Log plot to wandb
+        import wandb
+
+        wandb.log({"loss_curves": wandb.Image(plot_path)})
+        plt.show()
+
+    # Finish wandb run
+    wandb_logger.experiment.finish()
+
+    print("\nDone!")
