@@ -38,6 +38,19 @@ class ModelConfig:
     cortex_soft_kwta: bool = True
     cortex_temperature: float = 1.0
 
+    # Ablation: disable attention (identity)
+    disable_attention: bool = False
+
+    # TTT-E2E (Cortex): adapt gate weights at test time
+    cortex_use_ttt_e2e: bool = False
+    cortex_ttt_lr: float = 1.0
+    cortex_ttt_batch_size: int = 16
+
+    # TTT-E2E (Dense): adapt MLP weights at test time
+    dense_use_ttt_e2e: bool = False
+    dense_ttt_lr: float = 1.0
+    dense_ttt_batch_size: int = 16
+
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, config):
@@ -73,6 +86,7 @@ class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        self.disable_attention = getattr(config, "disable_attention", False)
 
         self.n_heads = config.n_heads
         self.n_kv_heads = config.n_kv_heads
@@ -87,6 +101,9 @@ class CausalSelfAttention(nn.Module):
         self.o_proj = nn.Linear(self.n_embed, self.n_embed, bias=False)
 
     def forward(self, x, cos, sin):
+        if self.disable_attention:
+            return torch.zeros_like(x)
+
         B, T, C = x.size()
 
         q = self.q_proj(x)
@@ -144,6 +161,7 @@ class Qwen3Attention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        self.disable_attention = getattr(config, "disable_attention", False)
 
         self.n_heads = config.n_heads
         self.n_kv_heads = config.n_kv_heads
@@ -170,6 +188,9 @@ class Qwen3Attention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
     def forward(self, x, cos, sin):
+        if self.disable_attention:
+            return torch.zeros_like(x)
+
         B, T, C = x.size()
 
         q = self.q_proj(x)
@@ -256,6 +277,7 @@ class Qwen3MoeAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        self.disable_attention = getattr(config, "disable_attention", False)
 
         self.n_heads = config.n_heads
         self.n_kv_heads = config.n_kv_heads
@@ -282,6 +304,9 @@ class Qwen3MoeAttention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
     def forward(self, x, cos, sin):
+        if self.disable_attention:
+            return torch.zeros_like(x)
+
         B, T, C = x.size()
 
         q = self.q_proj(x)
@@ -376,7 +401,7 @@ class MLP(nn.Module):
         self.up_proj = nn.Linear(config.n_embed, config.n_mlp, bias=False)
         self.down_proj = nn.Linear(config.n_mlp, config.n_embed, bias=False)
 
-    def forward(self, x):
+    def forward(self, x, weight_overrides=None):
         """
         1. Gate projection: Transform input to higher dimension (like expanding your thinking space)
         2. Up projection: Another transformation to same higher dimension
@@ -402,7 +427,24 @@ class MLP(nn.Module):
         3. SwiGLU = Swish + GLU
 
         Combining these: SwiGLU(x) = (x × W_gate) ⊗ SiLU(x × W_up) = gate * content
+
+        Args:
+            x: Input tensor
+            weight_overrides: Optional dict with 'gate_proj', 'up_proj', 'down_proj' weight tensors
+                              for TTT-E2E (differentiable weight adaptation)
         """
+        if weight_overrides:
+            # Use overridden weights (for TTT-E2E with 2nd-order gradients)
+            gate_w = weight_overrides.get("gate_proj", self.gate_proj.weight)
+            up_w = weight_overrides.get("up_proj", self.up_proj.weight)
+            down_w = weight_overrides.get("down_proj", self.down_proj.weight)
+            gate = F.linear(x, gate_w)
+            up = F.linear(x, up_w)
+            hidden = F.silu(gate) * up
+            output = F.linear(hidden, down_w)
+            return output
+
+        # Standard path
         gate = self.gate_proj(x)  # x × W_gate (to n_mlp dimension)
         up = self.up_proj(x)  # x × W_up (to n_mlp dimension)
         hidden = F.silu(gate) * up
@@ -498,9 +540,13 @@ class CortexFeedForward(nn.Module):
             self.lateral = nn.Conv2d(1, 1, kernel_size=3, padding=1, bias=False)
             nn.init.constant_(self.lateral.weight, 1.0 / 9.0)
 
-    def forward(self, x):
+    def forward(self, x, gate_weight_override=None):
         # Compute mask logits from input
-        mask_logits = self.gate(x)
+        # Use override if provided (for E2E differentiable update)
+        if gate_weight_override is not None:
+            mask_logits = F.linear(x, gate_weight_override)
+        else:
+            mask_logits = self.gate(x)
 
         # Optional lateral refinement
         if self.use_lateral and self.lateral_steps > 0:
@@ -592,9 +638,11 @@ class Qwen3Block(nn.Module):
         self.post_attention_layernorm = RMSNorm(n_embed=n_embed, eps=eps)
         self.mlp = MLP(config)
 
-    def forward(self, x, cos, sin):
+    def forward(self, x, cos, sin, mlp_weight_overrides=None):
         x = x + self.self_attn(self.input_layernorm(x), cos, sin)
-        x = x + self.mlp(self.post_attention_layernorm(x))
+        x = x + self.mlp(
+            self.post_attention_layernorm(x), weight_overrides=mlp_weight_overrides
+        )
         return x
 
 
@@ -618,9 +666,16 @@ class Qwen3MoeBlock(nn.Module):
         else:
             self.mlp = MLP(config)
 
-    def forward(self, x, cos, sin):
+    def forward(self, x, cos, sin, gate_weight_override=None):
         x = x + self.self_attn(self.input_layernorm(x), cos, sin)
-        x = x + self.mlp(self.post_attention_layernorm(x))
+        # Pass gate_weight_override to MLP (only CortexFeedForward uses it)
+        if gate_weight_override is not None and hasattr(self.mlp, "gate"):
+            x = x + self.mlp(
+                self.post_attention_layernorm(x),
+                gate_weight_override=gate_weight_override,
+            )
+        else:
+            x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
 
@@ -852,10 +907,13 @@ class Qwen3Model(nn.Module):
         # Store config for convenience
         self.config = config
 
-    def forward(self, x, position_ids):
+    def forward(self, x, position_ids, mlp_overrides_by_layer=None):
         cos, sin = self.rotary_emb(x, position_ids)
-        for layer in self.layers:
-            x = layer(x, cos, sin)
+        for i, layer in enumerate(self.layers):
+            overrides = (
+                mlp_overrides_by_layer.get(i) if mlp_overrides_by_layer else None
+            )
+            x = layer(x, cos, sin, mlp_weight_overrides=overrides)
         x = self.norm(x)
         return x
 
@@ -877,10 +935,12 @@ class Qwen3MoeModel(nn.Module):
         # Store config for convenience
         self.config = config
 
-    def forward(self, x, position_ids):
+    def forward(self, x, position_ids, gate_weight_overrides=None):
         cos, sin = self.rotary_emb(x, position_ids)
-        for layer in self.layers:
-            x = layer(x, cos, sin)
+        for i, layer in enumerate(self.layers):
+            # Pass per-layer gate_weight override if provided
+            override = gate_weight_overrides.get(i) if gate_weight_overrides else None
+            x = layer(x, cos, sin, gate_weight_override=override)
         x = self.norm(x)
         return x
 
@@ -904,10 +964,20 @@ class Qwen3(nn.Module):
         position_ids = position_ids.unsqueeze(0).expand(B, -1)
         return position_ids
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor = None,
+        mlp_overrides_by_layer=None,
+    ) -> torch.Tensor:
         x = self.model.embed_tokens(input_ids)
-        position_ids = self._get_position_ids(input_ids)
-        x = self.model(x=x, position_ids=position_ids)
+        if position_ids is None:
+            position_ids = self._get_position_ids(input_ids)
+        x = self.model(
+            x=x,
+            position_ids=position_ids,
+            mlp_overrides_by_layer=mlp_overrides_by_layer,
+        )
 
         if self.lm_head is None:
             logits = torch.matmul(x, self.model.embed_tokens.weight.T)
@@ -976,10 +1046,18 @@ class Qwen3MoE(nn.Module):
         position_ids = position_ids.unsqueeze(0).expand(B, -1)
         return position_ids
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor = None,
+        gate_weight_overrides=None,
+    ) -> torch.Tensor:
         x = self.model.embed_tokens(input_ids)
-        position_ids = self._get_position_ids(input_ids)
-        x = self.model(x=x, position_ids=position_ids)
+        if position_ids is None:
+            position_ids = self._get_position_ids(input_ids)
+        x = self.model(
+            x=x, position_ids=position_ids, gate_weight_overrides=gate_weight_overrides
+        )
 
         if self.lm_head is None:
             logits = torch.matmul(x, self.model.embed_tokens.weight.T)
