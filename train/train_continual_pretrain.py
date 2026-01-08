@@ -402,7 +402,7 @@ MODEL_CONFIGS = {
     "moe-small": ("moe", QWEN3_MOE_SMALL_CONFIG),
     "cortex-active": ("cortex", QWEN3_CORTEX_ACTIVE_CONFIG),
     "cortex-flops": ("cortex", QWEN3_CORTEX_FLOPS_CONFIG),
-    "cortex-e2e": ("cortex", QWEN3_CORTEX_E2E_CONFIG),
+    "cortex-ttt": ("cortex", QWEN3_CORTEX_E2E_CONFIG),
 }
 
 # =============================================================================

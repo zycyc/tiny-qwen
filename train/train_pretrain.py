@@ -44,7 +44,7 @@ QWEN3_MOE_SMALL_CONFIG = ModelConfig(
     # MoE parameters
     num_experts=8,
     num_experts_per_tok=2,
-    moe_intermediate_size=512,
+    moe_intermediate_size=2048,
 )
 
 # Cortex model: Continuous expert with learned masks
