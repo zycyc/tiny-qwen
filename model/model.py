@@ -1,5 +1,3 @@
-import math
-import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -33,10 +31,12 @@ class ModelConfig:
     use_cortex: bool = False
     cortex_hidden_size: Optional[int] = None
     cortex_k_ratio: int = 8
-    cortex_use_lateral: bool = False
-    cortex_lateral_steps: int = 0
     cortex_soft_kwta: bool = True
     cortex_temperature: float = 1.0
+    cortex_low_rank_gate: bool = False
+    cortex_gate_rank: Optional[int] = None  # e.g., 64
+    cortex_gate_norm: bool = False  # normalize gate logits before k-WTA
+    cortex_topk_softmax: bool = False  # Use simpler topk+softmax instead of kWTA
 
     # Ablation: disable attention (identity)
     disable_attention: bool = False
@@ -50,6 +50,13 @@ class ModelConfig:
     dense_use_ttt_e2e: bool = False
     dense_ttt_lr: float = 1.0
     dense_ttt_batch_size: int = 16
+
+    # TTT-E2E (MoE): adapt gate and/or expert weights at test time
+    moe_use_ttt_e2e: bool = False
+    moe_ttt_lr: float = 1.0
+    moe_ttt_batch_size: int = 16
+    moe_ttt_adapt_gate: bool = True  # Adapt router gate weights
+    moe_ttt_adapt_experts: bool = False  # Adapt expert MLP weights
 
 
 class RotaryEmbedding(nn.Module):
@@ -474,17 +481,42 @@ class MoEFeedForward(nn.Module):
             )
             self.experts.append(expert)
 
-    def forward(self, x):
+    def forward(self, x, gate_weight_override=None, expert_weight_overrides=None):
+        """
+        Args:
+            x: Input tensor (b, seq_len, embed_dim)
+            gate_weight_override: Optional tensor to override self.gate.weight
+                                 Shape: (num_experts, n_embed)
+            expert_weight_overrides: Optional dict {expert_idx: {'gate_proj': w, 'up_proj': w, 'down_proj': w}}
+                                    For TTT-E2E with 2nd-order gradients
+        """
         b, seq_len, embed_dim = x.shape
-        scores = self.gate(x)  # (b, seq_len, num_experts)
+
+        # Gate computation with optional override
+        if gate_weight_override is not None:
+            scores = F.linear(x, gate_weight_override)
+        else:
+            scores = self.gate(x)  # (b, seq_len, num_experts)
+
         topk_scores, topk_indices = torch.topk(scores, self.num_experts_per_tok, dim=-1)
         topk_probs = torch.softmax(topk_scores, dim=-1)
 
+        # Expert computation with optional overrides
         expert_outputs = []
         for e in range(self.num_experts):
             expert = self.experts[e]
-            hidden = F.silu(expert.gate_proj(x)) * expert.up_proj(x)
-            out = expert.down_proj(hidden)
+            if expert_weight_overrides is not None and e in expert_weight_overrides:
+                # Use overridden weights for this expert (for TTT-E2E)
+                overrides = expert_weight_overrides[e]
+                gate_w = overrides.get("gate_proj", expert.gate_proj.weight)
+                up_w = overrides.get("up_proj", expert.up_proj.weight)
+                down_w = overrides.get("down_proj", expert.down_proj.weight)
+                hidden = F.silu(F.linear(x, gate_w)) * F.linear(x, up_w)
+                out = F.linear(hidden, down_w)
+            else:
+                # Standard path
+                hidden = F.silu(expert.gate_proj(x)) * expert.up_proj(x)
+                out = expert.down_proj(hidden)
             expert_outputs.append(out.unsqueeze(-2))
         expert_outputs = torch.cat(
             expert_outputs, dim=-2
@@ -516,45 +548,65 @@ class CortexFeedForward(nn.Module):
             config.cortex_hidden_size or config.moe_intermediate_size or 4096
         )
 
-        # Ensure perfect square for 2D layout (for optional lateral convolutions)
-        self.square_dim = int(math.ceil(math.sqrt(self.hidden_size)))
-        self.hidden_size = self.square_dim * self.square_dim
-
         # Sparsity: k active units out of hidden_size
         self.k = self.hidden_size // config.cortex_k_ratio
         self.soft_kwta = config.cortex_soft_kwta
         self.temperature = config.cortex_temperature
+        self.topk_softmax = getattr(config, "cortex_topk_softmax", False)
 
         # Gate network: predicts which hidden units to activate
-        self.gate = nn.Linear(self.n_embed, self.hidden_size, bias=False)
+        self.low_rank_gate = getattr(config, "cortex_low_rank_gate", False)
+        if self.low_rank_gate:
+            gate_rank = getattr(config, "cortex_gate_rank", None) or 64
+            self.gate_down = nn.Linear(self.n_embed, gate_rank, bias=False)
+            self.gate_up = nn.Linear(gate_rank, self.hidden_size, bias=False)
+        else:
+            self.gate = nn.Linear(self.n_embed, self.hidden_size, bias=False)
+
+        # Optional gate normalization to prevent scale drift
+        self.gate_norm_enabled = getattr(config, "cortex_gate_norm", False)
+        if self.gate_norm_enabled:
+            self.gate_norm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
 
         # SwiGLU-style projections
         self.gate_proj = nn.Linear(self.n_embed, self.hidden_size, bias=False)
         self.up_proj = nn.Linear(self.n_embed, self.hidden_size, bias=False)
         self.down_proj = nn.Linear(self.hidden_size, self.n_embed, bias=False)
 
-        # Optional lateral convolutions for attractor dynamics
-        self.use_lateral = config.cortex_use_lateral
-        self.lateral_steps = config.cortex_lateral_steps
-        if self.use_lateral:
-            self.lateral = nn.Conv2d(1, 1, kernel_size=3, padding=1, bias=False)
-            nn.init.constant_(self.lateral.weight, 1.0 / 9.0)
-
     def forward(self, x, gate_weight_override=None):
         # Compute mask logits from input
-        # Use override if provided (for E2E differentiable update)
         if gate_weight_override is not None:
-            mask_logits = F.linear(x, gate_weight_override)
+            if isinstance(gate_weight_override, tuple):
+                # Low-rank override: (gate_down_weight, gate_up_weight)
+                gate_down_weight, gate_up_weight = gate_weight_override
+                mask_logits = F.linear(F.linear(x, gate_down_weight), gate_up_weight)
+            else:
+                # Full gate override
+                mask_logits = F.linear(x, gate_weight_override)
+        elif self.low_rank_gate:
+            mask_logits = self.gate_up(self.gate_down(x))
         else:
             mask_logits = self.gate(x)
 
-        # Optional lateral refinement
-        if self.use_lateral and self.lateral_steps > 0:
-            mask_logits = self._apply_lateral(mask_logits)
+        # Normalize gate logits to prevent scale drift
+        if self.gate_norm_enabled:
+            mask_logits = self.gate_norm(mask_logits)
 
         # Sparsify to get mask
-        # if self.training and self.soft_kwta:
-        if self.soft_kwta:
+        if self.topk_softmax:
+            # TopK + softmax with straight-through gradients to all positions
+            topk_scores, topk_indices = torch.topk(mask_logits, self.k, dim=-1)
+            topk_probs = torch.softmax(topk_scores, dim=-1)
+            hard_mask = torch.zeros_like(mask_logits)
+            hard_mask.scatter_(dim=-1, index=topk_indices, src=topk_probs)
+
+            # Soft surrogate for backward pass (gradients to ALL positions)
+            soft_mask = torch.softmax(mask_logits, dim=-1)
+
+            # Straight-through: forward=hard_mask, backward=soft_mask
+            mask = soft_mask + (hard_mask - soft_mask).detach()
+        elif self.soft_kwta:
+            # ST-topk: hard forward, soft backward
             mask = self._soft_kwta(mask_logits)
         else:
             mask = self._hard_kwta(mask_logits)
@@ -565,25 +617,54 @@ class CortexFeedForward(nn.Module):
         return self.down_proj(hidden)
 
     def _soft_kwta(self, logits):
-        """Differentiable approximation to k-winner-take-all."""
-        topk_vals, _ = torch.topk(logits, self.k, dim=-1)
-        threshold = topk_vals[..., -1:].detach()
-        return torch.sigmoid((logits - threshold) / self.temperature)
+        """
+        Straight-through kWTA:
+        - Forward: hard top-k mask (exactly k ones)
+        - Backward: gradients flow through a dense sigmoid surrogate
 
-    def _hard_kwta(self, logits):
-        """Hard k-winner-take-all for inference."""
-        topk_idx = torch.topk(logits, self.k, dim=-1).indices
-        mask = torch.zeros_like(logits)
-        mask.scatter_(-1, topk_idx, 1.0)
+        This usually performs much closer to your current soft-kWTA than the
+        softmax-on-topk surrogate I suggested earlier.
+        """
+        H = logits.size(-1)
+        k = int(self.k)
+        if k <= 0:
+            return torch.zeros_like(logits)
+        if k >= H:
+            return torch.ones_like(logits)
+
+        # Top-k winners and hard mask
+        topk_vals, topk_idx = torch.topk(logits, k, dim=-1)
+        hard = torch.zeros_like(logits).scatter(-1, topk_idx, 1.0)
+
+        # soft surrogate (dense)
+        # Important: detach threshold so we don't get weird/unstable gradients through it.
+        threshold = topk_vals[..., -1:].detach()
+        temp = float(self.temperature)
+        if temp <= 0:
+            temp = 1e-6
+        soft = torch.sigmoid((logits - threshold) / temp)
+
+        # (Optional but often helpful) match scale: keep expected sum close to k
+        # This prevents the model from getting "free extra capacity" by making soft too dense.
+        # Comment out if it hurts.
+        soft_sum = soft.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        soft = soft * (k / soft_sum)
+
+        # Straight-through: hard forward, soft backward
+        mask = soft + (hard - soft).detach()
         return mask
 
-    def _apply_lateral(self, mask_logits):
-        """Apply lateral convolution for attractor dynamics."""
-        b, seq, h = mask_logits.shape
-        x = mask_logits.view(b * seq, 1, self.square_dim, self.square_dim)
-        for _ in range(self.lateral_steps):
-            x = self.lateral(x)
-        return x.view(b, seq, self.hidden_size)
+    def _hard_kwta(self, logits):
+        """Hard k-winner-take-all. Returns a {0,1} mask with exactly k ones per token."""
+        H = logits.size(-1)
+        k = int(self.k)
+        if k <= 0:
+            return torch.zeros_like(logits)
+        if k >= H:
+            return torch.ones_like(logits)
+
+        topk_idx = torch.topk(logits, k, dim=-1).indices
+        return torch.zeros_like(logits).scatter(-1, topk_idx, 1.0)
 
 
 class Block(nn.Module):
@@ -666,10 +747,21 @@ class Qwen3MoeBlock(nn.Module):
         else:
             self.mlp = MLP(config)
 
-    def forward(self, x, cos, sin, gate_weight_override=None):
+    def forward(
+        self, x, cos, sin, gate_weight_override=None, expert_weight_overrides=None
+    ):
         x = x + self.self_attn(self.input_layernorm(x), cos, sin)
-        # Pass gate_weight_override to MLP (only CortexFeedForward uses it)
-        if gate_weight_override is not None and hasattr(self.mlp, "gate"):
+        # Pass weight overrides to MLP (MoEFeedForward or CortexFeedForward)
+        if isinstance(self.mlp, MoEFeedForward):
+            x = x + self.mlp(
+                self.post_attention_layernorm(x),
+                gate_weight_override=gate_weight_override,
+                expert_weight_overrides=expert_weight_overrides,
+            )
+        elif gate_weight_override is not None and isinstance(
+            self.mlp, CortexFeedForward
+        ):
+            # CortexFeedForward path (supports both full and low-rank gates)
             x = x + self.mlp(
                 self.post_attention_layernorm(x),
                 gate_weight_override=gate_weight_override,
@@ -935,12 +1027,36 @@ class Qwen3MoeModel(nn.Module):
         # Store config for convenience
         self.config = config
 
-    def forward(self, x, position_ids, gate_weight_overrides=None):
+    def forward(
+        self,
+        x,
+        position_ids,
+        gate_weight_overrides=None,
+        expert_weight_overrides_by_layer=None,
+    ):
+        """
+        Args:
+            gate_weight_overrides: dict {layer_idx: gate_weight_tensor}
+            expert_weight_overrides_by_layer: dict {layer_idx: {expert_idx: {'gate_proj': w, ...}}}
+        """
         cos, sin = self.rotary_emb(x, position_ids)
         for i, layer in enumerate(self.layers):
-            # Pass per-layer gate_weight override if provided
-            override = gate_weight_overrides.get(i) if gate_weight_overrides else None
-            x = layer(x, cos, sin, gate_weight_override=override)
+            # Pass per-layer weight overrides if provided
+            gate_override = (
+                gate_weight_overrides.get(i) if gate_weight_overrides else None
+            )
+            expert_overrides = (
+                expert_weight_overrides_by_layer.get(i)
+                if expert_weight_overrides_by_layer
+                else None
+            )
+            x = layer(
+                x,
+                cos,
+                sin,
+                gate_weight_override=gate_override,
+                expert_weight_overrides=expert_overrides,
+            )
         x = self.norm(x)
         return x
 
@@ -1051,12 +1167,16 @@ class Qwen3MoE(nn.Module):
         input_ids: torch.Tensor,
         position_ids: torch.Tensor = None,
         gate_weight_overrides=None,
+        expert_weight_overrides_by_layer=None,
     ) -> torch.Tensor:
         x = self.model.embed_tokens(input_ids)
         if position_ids is None:
             position_ids = self._get_position_ids(input_ids)
         x = self.model(
-            x=x, position_ids=position_ids, gate_weight_overrides=gate_weight_overrides
+            x=x,
+            position_ids=position_ids,
+            gate_weight_overrides=gate_weight_overrides,
+            expert_weight_overrides_by_layer=expert_weight_overrides_by_layer,
         )
 
         if self.lm_head is None:

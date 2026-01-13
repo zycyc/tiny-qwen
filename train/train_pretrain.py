@@ -17,11 +17,11 @@ from huggingface_hub import PyTorchModelHubMixin
 
 # Dense model: Qwen3
 QWEN3_CONFIG = ModelConfig(
-    n_embed=768,  # was 1024
-    n_heads=12,  # was 16
-    n_kv_heads=4,  # was 8
-    n_layer=12,  # was 28
-    n_mlp=4033,  # was 3072 (or 4034)
+    n_embed=384,
+    n_heads=6,
+    n_kv_heads=2,
+    n_layer=2,
+    n_mlp=1536,  # 4*n_embed = 1536
     vocab_size=151936,
     rope_theta=1000000,
     rms_norm_eps=1e-6,
@@ -30,12 +30,12 @@ QWEN3_CONFIG = ModelConfig(
 )
 
 # MoE model: Small MoE (~600M total, ~200M active)
-QWEN3_MOE_SMALL_CONFIG = ModelConfig(
-    n_embed=768,
-    n_heads=12,
-    n_kv_heads=4,
-    n_layer=12,
-    n_mlp=2048,
+QWEN3_MOE_CONFIG = ModelConfig(
+    n_embed=384,
+    n_heads=6,
+    n_kv_heads=2,
+    n_layer=2,
+    n_mlp=1536,  # placeholder, not used
     vocab_size=151936,
     rope_theta=1000000,
     rms_norm_eps=1e-6,
@@ -44,16 +44,17 @@ QWEN3_MOE_SMALL_CONFIG = ModelConfig(
     # MoE parameters
     num_experts=8,
     num_experts_per_tok=2,
-    moe_intermediate_size=2048,
+    # to match total param of dense -- (3*1536 - 8) / (3*8) = 192
+    moe_intermediate_size=767,  # roughly n_mlp / num_experts_per_tok (ignoring insignificant routing FLOPs). To be specific, x = (3 * n_mlp - num_experts) / (3 * num_experts_per_tok) = 766.67
 )
 
 # Cortex model: Continuous expert with learned masks
-QWEN3_CORTEX_SMALL_CONFIG = ModelConfig(
-    n_embed=768,
-    n_heads=12,
-    n_kv_heads=4,
-    n_layer=12,
-    n_mlp=2048,
+QWEN3_CORTEX_CONFIG = ModelConfig(
+    n_embed=384,
+    n_heads=6,
+    n_kv_heads=2,
+    n_layer=2,
+    n_mlp=1536,  # placeholder, not used
     vocab_size=151936,
     rope_theta=1000000,
     rms_norm_eps=1e-6,
@@ -61,18 +62,21 @@ QWEN3_CORTEX_SMALL_CONFIG = ModelConfig(
     head_dim=64,
     # Cortex parameters
     use_cortex=True,
-    cortex_hidden_size=3025,  # 55x55 grid (matches MoE total params)
-    cortex_k_ratio=3,  # k=1008 active units (matches MoE's 1024)
-    cortex_soft_kwta=True,
+    # to match total param of dense -- 1536*3/4 = 1152, or (3*1536-64) * 384 / (3*384+64) = 1435 when using lor gate
+    cortex_hidden_size=4957,  # 2633 for normal gate, 4957 for low-rank gate
+    cortex_k_ratio=4,  # k=1536 active units (matches Dense n_mlp)
+    cortex_topk_softmax=True,
+    cortex_soft_kwta=False,
     cortex_temperature=1.0,
-    cortex_use_lateral=False,
-    cortex_lateral_steps=0,
+    cortex_low_rank_gate=True,  # False for normal gate, True for low-rank gate
+    cortex_gate_rank=64,  # 64 for low-rank gate
+    cortex_gate_norm=True,  # normalize gate logits to prevent scale drift
 )
 
 MODEL_CONFIGS = {
     "dense": ("dense", QWEN3_CONFIG),
-    "moe-small": ("moe", QWEN3_MOE_SMALL_CONFIG),
-    "cortex-small": ("cortex", QWEN3_CORTEX_SMALL_CONFIG),
+    "moe": ("moe", QWEN3_MOE_CONFIG),
+    "cortex": ("cortex", QWEN3_CORTEX_CONFIG),
 }
 
 

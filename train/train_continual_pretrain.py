@@ -26,7 +26,7 @@ from torch.utils.data import IterableDataset, Dataset, DataLoader
 from datasets import load_dataset
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint, Callback
-from model.model import Qwen3, Qwen3MoE, ModelConfig
+from model.model import Qwen3, Qwen3MoE, ModelConfig, MoEFeedForward
 
 
 # =============================================================================
@@ -270,7 +270,7 @@ QWEN3_CONFIG = ModelConfig(
     n_heads=6,
     n_kv_heads=2,
     n_layer=2,
-    n_mlp=1536,
+    n_mlp=1536,  # 4*n_embed
     vocab_size=151936,
     rope_theta=1000000,
     rms_norm_eps=1e-6,
@@ -282,12 +282,12 @@ QWEN3_CONFIG = ModelConfig(
 # MoE model: Traditional sparse mixture of experts
 # Sized so active params (2 experts) ≈ dense model total params
 # Active per layer: router (6,144) + 2 experts × 3 × 384 × 2015 = 9,291,264
-QWEN3_MOE_SMALL_CONFIG = ModelConfig(
+QWEN3_MOE_CONFIG = ModelConfig(
     n_embed=384,
     n_heads=6,
     n_kv_heads=2,
     n_layer=2,
-    n_mlp=2015,
+    n_mlp=1536,  # placeholder, not used
     vocab_size=151936,
     rope_theta=1000000,
     rms_norm_eps=1e-6,
@@ -296,56 +296,8 @@ QWEN3_MOE_SMALL_CONFIG = ModelConfig(
     # MoE parameters
     num_experts=8,
     num_experts_per_tok=2,
-    moe_intermediate_size=2015,
-)
-
-# Cortex model: Continuous expert with learned masks
-# Formula: cortex_hidden_size = num_experts_per_tok × n_mlp_moe × k_ratio (active capacity matching)
-# k = 4030 active units = MoE active capacity (2 experts × 2015)
-# Note: Cortex uses ~4× FLOPs vs dense, but matches active capacity for fair interference comparison
-QWEN3_CORTEX_ACTIVE_CONFIG = ModelConfig(
-    n_embed=384,
-    n_heads=6,
-    n_kv_heads=2,
-    n_layer=2,
-    n_mlp=4030,  # = 2 × n_mlp_moe, same as dense for consistency
-    vocab_size=151936,
-    rope_theta=1000000,
-    rms_norm_eps=1e-6,
-    tie_word_embeddings=False,
-    head_dim=64,
-    # Cortex parameters
-    use_cortex=True,
-    cortex_hidden_size=6400,  # k × k_ratio = 4030 × 3 (active capacity matches MoE)
-    cortex_k_ratio=4,
-    cortex_soft_kwta=True,
-    cortex_temperature=1.0,
-    cortex_use_lateral=False,
-    cortex_lateral_steps=0,
-)
-
-# Cortex model: Continuous expert with learned masks
-# Formula: cortex_hidden_size = (3/4) × n_mlp (so cortex_FLOPs = dense_FLOPs)
-# k = H / k_ratio = 1008 active units (33% sparsity)
-QWEN3_CORTEX_FLOPS_CONFIG = ModelConfig(
-    n_embed=384,
-    n_heads=6,
-    n_kv_heads=2,
-    n_layer=2,
-    n_mlp=4033,  # required positional arg, but doesn't matter here
-    vocab_size=151936,
-    rope_theta=1000000,
-    rms_norm_eps=1e-6,
-    tie_word_embeddings=False,
-    head_dim=64,
-    # Cortex parameters
-    use_cortex=True,
-    cortex_hidden_size=1600,  # (3/4) × n_mlp ≈ 3022.5, use 55×55 so cortex_FLOPs = dense_FLOPs
-    cortex_k_ratio=4,
-    cortex_soft_kwta=True,
-    cortex_temperature=1.0,
-    cortex_use_lateral=False,
-    cortex_lateral_steps=0,
+    moe_intermediate_size=766,
+    disable_attention=True,
 )
 
 # Cortex E2E: Meta-learning with inner/outer loop
@@ -363,12 +315,14 @@ QWEN3_CORTEX_E2E_CONFIG = ModelConfig(
     head_dim=64,
     # Cortex parameters
     use_cortex=True,
-    cortex_hidden_size=1600,
+    cortex_hidden_size=4957,
     cortex_k_ratio=4,
+    cortex_topk_softmax=False,
     cortex_soft_kwta=True,
     cortex_temperature=1.0,
-    cortex_use_lateral=False,
-    cortex_lateral_steps=0,
+    cortex_low_rank_gate=True,  # False for normal gate, True for low-rank gate
+    cortex_gate_rank=64,  # 64 for low-rank gate
+    cortex_gate_norm=True,  # normalize gate logits to prevent scale drift
     # TTT-E2E: sequential gate weight adaptation
     cortex_use_ttt_e2e=True,
     cortex_ttt_lr=1.0,
@@ -396,12 +350,62 @@ QWEN3_DENSE_TTT_CONFIG = ModelConfig(
     dense_ttt_batch_size=16,  # Adapt weights every 16 tokens
 )
 
+# MoE TTT-E2E (gate only): Adapt router gate weights at test time
+QWEN3_MOE_TTT_GATE_CONFIG = ModelConfig(
+    n_embed=384,
+    n_heads=6,
+    n_kv_heads=2,
+    n_layer=2,
+    n_mlp=1536,  # placeholder, not used
+    vocab_size=151936,
+    rope_theta=1000000,
+    rms_norm_eps=1e-6,
+    tie_word_embeddings=False,
+    head_dim=64,
+    disable_attention=True,
+    # MoE parameters
+    num_experts=8,
+    num_experts_per_tok=2,
+    moe_intermediate_size=766,
+    # MoE TTT-E2E parameters
+    moe_use_ttt_e2e=True,
+    moe_ttt_lr=1.0,
+    moe_ttt_batch_size=16,
+    moe_ttt_adapt_gate=True,
+    moe_ttt_adapt_experts=False,
+)
+
+# MoE TTT-E2E (experts only): Adapt expert MLP weights at test time
+QWEN3_MOE_TTT_EXPERT_CONFIG = ModelConfig(
+    n_embed=384,
+    n_heads=6,
+    n_kv_heads=2,
+    n_layer=2,
+    n_mlp=1536,  # placeholder, not used
+    vocab_size=151936,
+    rope_theta=1000000,
+    rms_norm_eps=1e-6,
+    tie_word_embeddings=False,
+    head_dim=64,
+    disable_attention=True,
+    # MoE parameters
+    num_experts=8,
+    num_experts_per_tok=2,
+    moe_intermediate_size=766,
+    # MoE TTT-E2E parameters
+    moe_use_ttt_e2e=True,
+    moe_ttt_lr=1.0,
+    moe_ttt_batch_size=16,
+    moe_ttt_adapt_gate=False,
+    moe_ttt_adapt_experts=True,
+)
+
 MODEL_CONFIGS = {
     "dense": ("dense", QWEN3_CONFIG),
     "dense-ttt": ("dense", QWEN3_DENSE_TTT_CONFIG),
-    "moe-small": ("moe", QWEN3_MOE_SMALL_CONFIG),
-    "cortex-active": ("cortex", QWEN3_CORTEX_ACTIVE_CONFIG),
-    "cortex-flops": ("cortex", QWEN3_CORTEX_FLOPS_CONFIG),
+    "moe": ("moe", QWEN3_MOE_CONFIG),
+    "moe-ttt-gate": ("moe", QWEN3_MOE_TTT_GATE_CONFIG),
+    "moe-ttt-expert": ("moe", QWEN3_MOE_TTT_EXPERT_CONFIG),
     "cortex-ttt": ("cortex", QWEN3_CORTEX_E2E_CONFIG),
 }
 
@@ -468,6 +472,14 @@ class Qwen3ForContinualPretrain(L.LightningModule):
             self.dense_ttt_lr = config.dense_ttt_lr
             self.dense_ttt_batch_size = getattr(config, "dense_ttt_batch_size", 16)
 
+        # MoE TTT-E2E (adapt gate and/or expert weights at test time)
+        self.use_moe_ttt_e2e = getattr(config, "moe_use_ttt_e2e", False)
+        if self.use_moe_ttt_e2e:
+            self.moe_ttt_lr = config.moe_ttt_lr
+            self.moe_ttt_batch_size = getattr(config, "moe_ttt_batch_size", 16)
+            self.moe_ttt_adapt_gate = getattr(config, "moe_ttt_adapt_gate", True)
+            self.moe_ttt_adapt_experts = getattr(config, "moe_ttt_adapt_experts", False)
+
     def forward(self, input_ids):
         return self.qwen_model(input_ids)
 
@@ -497,14 +509,27 @@ class Qwen3ForContinualPretrain(L.LightningModule):
 
             # 1. Collect gate weights by layer index
             gate_params = []
+            is_low_rank = False
             for i, layer in enumerate(self.qwen_model.model.layers):
                 if hasattr(layer.mlp, "gate"):
                     gate_params.append((i, layer.mlp.gate.weight))
+                elif getattr(layer.mlp, "low_rank_gate", False):
+                    is_low_rank = True
+                    gate_params.append(
+                        (i, (layer.mlp.gate_down.weight, layer.mlp.gate_up.weight))
+                    )
 
             # Initialize adapted weights as clones of original
             current_weights = {}
             for layer_idx, weight in gate_params:
-                current_weights[layer_idx] = weight.clone()
+                if is_low_rank:
+                    gate_down_w, gate_up_w = weight
+                    current_weights[layer_idx] = (
+                        gate_down_w.clone(),
+                        gate_up_w.clone(),
+                    )
+                else:
+                    current_weights[layer_idx] = weight.clone()
 
             # 2. Process sequence in chunks, adapting after each
             all_logits = []
@@ -544,22 +569,48 @@ class Qwen3ForContinualPretrain(L.LightningModule):
 
                 # Adapt weights based on this chunk's loss (except for last chunk)
                 if chunk_idx < num_chunks - 1:
-                    # Flatten current weights for gradient computation
-                    all_params = [current_weights[i] for i, _ in gate_params]
+                    if is_low_rank:
+                        # Collect all low-rank parameters (gate_down and gate_up for each layer)
+                        all_params = []
+                        for i, _ in gate_params:
+                            all_params.extend(
+                                [current_weights[i][0], current_weights[i][1]]
+                            )
 
-                    # Compute gradients with graph tracking
-                    grads = torch.autograd.grad(
-                        chunk_loss,
-                        all_params,
-                        create_graph=True,
-                        retain_graph=True,
-                    )
-
-                    # Update adapted weights
-                    for (layer_idx, _), grad in zip(gate_params, grads):
-                        current_weights[layer_idx] = (
-                            current_weights[layer_idx] - self.ttt_lr * grad
+                        # Compute gradients with graph tracking
+                        grads = torch.autograd.grad(
+                            chunk_loss,
+                            all_params,
+                            create_graph=True,
+                            retain_graph=True,
                         )
+
+                        # Update both gate_down and gate_up for each layer
+                        grad_idx = 0
+                        for layer_idx, _ in gate_params:
+                            gd_grad, gu_grad = grads[grad_idx], grads[grad_idx + 1]
+                            current_weights[layer_idx] = (
+                                current_weights[layer_idx][0] - self.ttt_lr * gd_grad,
+                                current_weights[layer_idx][1] - self.ttt_lr * gu_grad,
+                            )
+                            grad_idx += 2
+                    else:
+                        # Flatten current weights for gradient computation
+                        all_params = [current_weights[i] for i, _ in gate_params]
+
+                        # Compute gradients with graph tracking
+                        grads = torch.autograd.grad(
+                            chunk_loss,
+                            all_params,
+                            create_graph=True,
+                            retain_graph=True,
+                        )
+
+                        # Update adapted weights
+                        for (layer_idx, _), grad in zip(gate_params, grads):
+                            current_weights[layer_idx] = (
+                                current_weights[layer_idx] - self.ttt_lr * grad
+                            )
 
             # Combine all chunk logits
             logits_post = torch.cat(all_logits, dim=1)
@@ -711,6 +762,160 @@ class Qwen3ForContinualPretrain(L.LightningModule):
 
             return loss_post  # Optimize POST-TTT loss
 
+        elif self.use_moe_ttt_e2e:
+            # MoE TTT-E2E: Sequential mini-batch adaptation of gate and/or expert weights
+            batch_size, seq_len = input_ids.shape
+            chunk_size = self.moe_ttt_batch_size
+
+            # 1. Collect parameters to adapt
+            gate_params = []  # (layer_idx, gate_weight)
+            expert_params = []  # (layer_idx, expert_idx, {'gate_proj': w, ...})
+
+            for i, layer in enumerate(self.qwen_model.model.layers):
+                mlp = layer.mlp
+                if not isinstance(mlp, MoEFeedForward):
+                    continue
+
+                if self.moe_ttt_adapt_gate:
+                    gate_params.append((i, mlp.gate.weight))
+
+                if self.moe_ttt_adapt_experts:
+                    for e in range(mlp.num_experts):
+                        expert = mlp.experts[e]
+                        expert_params.append(
+                            (
+                                i,
+                                e,
+                                {
+                                    "gate_proj": expert.gate_proj.weight,
+                                    "up_proj": expert.up_proj.weight,
+                                    "down_proj": expert.down_proj.weight,
+                                },
+                            )
+                        )
+
+            # 2. Initialize adapted weights as clones
+            current_gate_weights = {}
+            for layer_idx, weight in gate_params:
+                current_gate_weights[layer_idx] = weight.clone()
+
+            current_expert_weights = {}  # {layer_idx: {expert_idx: {'gate_proj': w, ...}}}
+            for layer_idx, expert_idx, param_dict in expert_params:
+                if layer_idx not in current_expert_weights:
+                    current_expert_weights[layer_idx] = {}
+                current_expert_weights[layer_idx][expert_idx] = {
+                    key: param.clone() for key, param in param_dict.items()
+                }
+
+            # 3. Process sequence in chunks
+            all_logits = []
+            total_loss = 0.0
+            num_chunks = (seq_len + chunk_size - 1) // chunk_size
+
+            for chunk_idx in range(num_chunks):
+                start = chunk_idx * chunk_size
+                end = min(start + chunk_size, seq_len)
+
+                chunk_input = input_ids[:, start:end]
+                chunk_labels = labels[:, start:end]
+
+                # Position IDs for this chunk
+                chunk_position_ids = (
+                    torch.arange(start, end, device=input_ids.device, dtype=torch.long)
+                    .unsqueeze(0)
+                    .expand(batch_size, -1)
+                )
+
+                # Forward with adapted weights
+                logits_chunk = self.qwen_model(
+                    chunk_input,
+                    position_ids=chunk_position_ids,
+                    gate_weight_overrides=current_gate_weights
+                    if self.moe_ttt_adapt_gate
+                    else None,
+                    expert_weight_overrides_by_layer=current_expert_weights
+                    if self.moe_ttt_adapt_experts
+                    else None,
+                )
+                all_logits.append(logits_chunk)
+
+                # Compute chunk loss
+                chunk_loss = self.loss_fct(
+                    logits_chunk.reshape(-1, logits_chunk.size(-1)),
+                    chunk_labels.reshape(-1),
+                )
+                total_loss = total_loss + chunk_loss * (end - start)
+
+                # Adapt weights (except for last chunk)
+                if chunk_idx < num_chunks - 1:
+                    # Collect all params for gradient computation
+                    all_params = []
+                    if self.moe_ttt_adapt_gate:
+                        all_params.extend(
+                            [current_gate_weights[i] for i, _ in gate_params]
+                        )
+                    if self.moe_ttt_adapt_experts:
+                        for layer_idx, expert_idx, _ in expert_params:
+                            for key in ["gate_proj", "up_proj", "down_proj"]:
+                                all_params.append(
+                                    current_expert_weights[layer_idx][expert_idx][key]
+                                )
+
+                    # Compute gradients
+                    grads = torch.autograd.grad(
+                        chunk_loss,
+                        all_params,
+                        create_graph=True,
+                        retain_graph=True,
+                    )
+
+                    # Update weights
+                    grad_idx = 0
+                    if self.moe_ttt_adapt_gate:
+                        for layer_idx, _ in gate_params:
+                            current_gate_weights[layer_idx] = (
+                                current_gate_weights[layer_idx]
+                                - self.moe_ttt_lr * grads[grad_idx]
+                            )
+                            grad_idx += 1
+
+                    if self.moe_ttt_adapt_experts:
+                        for layer_idx, expert_idx, _ in expert_params:
+                            for key in ["gate_proj", "up_proj", "down_proj"]:
+                                current_expert_weights[layer_idx][expert_idx][key] = (
+                                    current_expert_weights[layer_idx][expert_idx][key]
+                                    - self.moe_ttt_lr * grads[grad_idx]
+                                )
+                                grad_idx += 1
+
+            # 4. Combine logits and compute final loss
+            logits_post = torch.cat(all_logits, dim=1)
+            loss_post = total_loss / seq_len
+
+            self.log(
+                "train_loss", loss_post, prog_bar=True, on_step=True, on_epoch=False
+            )
+            self.log("phase", float(self.current_phase), on_step=True, on_epoch=False)
+            self.train_losses.append(loss_post.detach().cpu())
+
+            # Log per-position loss periodically
+            if self.global_step % 100 == 0:
+                per_pos_loss = self.compute_per_position_loss(logits_post, labels)
+                seq_len = per_pos_loss.size(0)
+                self.logger.experiment.log(
+                    {
+                        "train_loss_token": wandb.plot.line_series(
+                            xs=list(range(seq_len)),
+                            ys=[per_pos_loss.detach().cpu().tolist()],
+                            keys=["loss"],
+                            title="Train Loss by Token Position",
+                            xname="position",
+                        )
+                    }
+                )
+
+            return loss_post
+
         else:
             # Standard forward pass
             logits = self(input_ids)
@@ -753,14 +958,27 @@ class Qwen3ForContinualPretrain(L.LightningModule):
 
                 # Collect gate weights by layer
                 gate_params = []
+                is_low_rank = False
                 for i, layer in enumerate(self.qwen_model.model.layers):
                     if hasattr(layer.mlp, "gate"):
                         gate_params.append((i, layer.mlp.gate.weight))
+                    elif getattr(layer.mlp, "low_rank_gate", False):
+                        is_low_rank = True
+                        gate_params.append(
+                            (i, (layer.mlp.gate_down.weight, layer.mlp.gate_up.weight))
+                        )
 
                 # Initialize adapted weights as clones of original
                 current_weights = {}
                 for layer_idx, weight in gate_params:
-                    current_weights[layer_idx] = weight.clone()
+                    if is_low_rank:
+                        gate_down_w, gate_up_w = weight
+                        current_weights[layer_idx] = (
+                            gate_down_w.clone(),
+                            gate_up_w.clone(),
+                        )
+                    else:
+                        current_weights[layer_idx] = weight.clone()
 
                 # Process sequence in chunks
                 all_logits = []
@@ -796,17 +1014,41 @@ class Qwen3ForContinualPretrain(L.LightningModule):
                             chunk_labels.reshape(-1),
                         )
 
-                        all_params = [current_weights[i] for i, _ in gate_params]
+                        if is_low_rank:
+                            # Collect all low-rank parameters
+                            all_params = []
+                            for i, _ in gate_params:
+                                all_params.extend(
+                                    [current_weights[i][0], current_weights[i][1]]
+                                )
 
-                        grads = torch.autograd.grad(
-                            chunk_loss, all_params, retain_graph=False
-                        )
-
-                        # Update adapted weights (no graph needed for validation)
-                        for (layer_idx, _), grad in zip(gate_params, grads):
-                            current_weights[layer_idx] = (
-                                current_weights[layer_idx] - self.ttt_lr * grad
+                            grads = torch.autograd.grad(
+                                chunk_loss, all_params, retain_graph=False
                             )
+
+                            # Update both gate_down and gate_up for each layer
+                            grad_idx = 0
+                            for layer_idx, _ in gate_params:
+                                gd_grad, gu_grad = grads[grad_idx], grads[grad_idx + 1]
+                                current_weights[layer_idx] = (
+                                    current_weights[layer_idx][0]
+                                    - self.ttt_lr * gd_grad,
+                                    current_weights[layer_idx][1]
+                                    - self.ttt_lr * gu_grad,
+                                )
+                                grad_idx += 2
+                        else:
+                            all_params = [current_weights[i] for i, _ in gate_params]
+
+                            grads = torch.autograd.grad(
+                                chunk_loss, all_params, retain_graph=False
+                            )
+
+                            # Update adapted weights (no graph needed for validation)
+                            for (layer_idx, _), grad in zip(gate_params, grads):
+                                current_weights[layer_idx] = (
+                                    current_weights[layer_idx] - self.ttt_lr * grad
+                                )
 
                 # Combine logits and compute final loss
                 logits_post = torch.cat(all_logits, dim=1)
@@ -899,6 +1141,142 @@ class Qwen3ForContinualPretrain(L.LightningModule):
                                     - self.dense_ttt_lr * grads[grad_idx]
                                 )
                                 grad_idx += 1
+
+                # Combine logits and compute final loss
+                logits_post = torch.cat(all_logits, dim=1)
+                loss = self.loss_fct(
+                    logits_post.reshape(-1, logits_post.size(-1)),
+                    labels.reshape(-1),
+                )
+                logits_for_pos_loss = logits_post
+
+        elif self.use_moe_ttt_e2e:
+            # MoE TTT-E2E: Sequential mini-batch adaptation of gate and/or expert weights
+            with torch.inference_mode(False), torch.enable_grad():
+                input_ids = input_ids.clone()
+                labels = labels.clone()
+
+                batch_size, seq_len = input_ids.shape
+                chunk_size = self.moe_ttt_batch_size
+
+                # Collect parameters to adapt
+                gate_params = []
+                expert_params = []
+
+                for i, layer in enumerate(self.qwen_model.model.layers):
+                    mlp = layer.mlp
+                    if not isinstance(mlp, MoEFeedForward):
+                        continue
+
+                    if self.moe_ttt_adapt_gate:
+                        gate_params.append((i, mlp.gate.weight))
+
+                    if self.moe_ttt_adapt_experts:
+                        for e in range(mlp.num_experts):
+                            expert = mlp.experts[e]
+                            expert_params.append(
+                                (
+                                    i,
+                                    e,
+                                    {
+                                        "gate_proj": expert.gate_proj.weight,
+                                        "up_proj": expert.up_proj.weight,
+                                        "down_proj": expert.down_proj.weight,
+                                    },
+                                )
+                            )
+
+                # Initialize adapted weights as clones
+                current_gate_weights = {}
+                for layer_idx, weight in gate_params:
+                    current_gate_weights[layer_idx] = weight.clone()
+
+                current_expert_weights = {}
+                for layer_idx, expert_idx, param_dict in expert_params:
+                    if layer_idx not in current_expert_weights:
+                        current_expert_weights[layer_idx] = {}
+                    current_expert_weights[layer_idx][expert_idx] = {
+                        key: param.clone() for key, param in param_dict.items()
+                    }
+
+                # Process sequence in chunks
+                all_logits = []
+                num_chunks = (seq_len + chunk_size - 1) // chunk_size
+
+                for chunk_idx in range(num_chunks):
+                    start = chunk_idx * chunk_size
+                    end = min(start + chunk_size, seq_len)
+
+                    chunk_input = input_ids[:, start:end]
+                    chunk_labels = labels[:, start:end]
+
+                    chunk_position_ids = (
+                        torch.arange(
+                            start, end, device=input_ids.device, dtype=torch.long
+                        )
+                        .unsqueeze(0)
+                        .expand(batch_size, -1)
+                    )
+
+                    logits_chunk = self.qwen_model(
+                        chunk_input,
+                        position_ids=chunk_position_ids,
+                        gate_weight_overrides=current_gate_weights
+                        if self.moe_ttt_adapt_gate
+                        else None,
+                        expert_weight_overrides_by_layer=current_expert_weights
+                        if self.moe_ttt_adapt_experts
+                        else None,
+                    )
+                    all_logits.append(logits_chunk)
+
+                    # Adapt weights (except for last chunk)
+                    if chunk_idx < num_chunks - 1:
+                        chunk_loss = self.loss_fct(
+                            logits_chunk.reshape(-1, logits_chunk.size(-1)),
+                            chunk_labels.reshape(-1),
+                        )
+
+                        all_params = []
+                        if self.moe_ttt_adapt_gate:
+                            all_params.extend(
+                                [current_gate_weights[i] for i, _ in gate_params]
+                            )
+                        if self.moe_ttt_adapt_experts:
+                            for layer_idx, expert_idx, _ in expert_params:
+                                for key in ["gate_proj", "up_proj", "down_proj"]:
+                                    all_params.append(
+                                        current_expert_weights[layer_idx][expert_idx][
+                                            key
+                                        ]
+                                    )
+
+                        grads = torch.autograd.grad(
+                            chunk_loss, all_params, retain_graph=False
+                        )
+
+                        # Update weights (no graph needed for validation)
+                        grad_idx = 0
+                        if self.moe_ttt_adapt_gate:
+                            for layer_idx, _ in gate_params:
+                                current_gate_weights[layer_idx] = (
+                                    current_gate_weights[layer_idx]
+                                    - self.moe_ttt_lr * grads[grad_idx]
+                                )
+                                grad_idx += 1
+
+                        if self.moe_ttt_adapt_experts:
+                            for layer_idx, expert_idx, _ in expert_params:
+                                for key in ["gate_proj", "up_proj", "down_proj"]:
+                                    current_expert_weights[layer_idx][expert_idx][
+                                        key
+                                    ] = (
+                                        current_expert_weights[layer_idx][expert_idx][
+                                            key
+                                        ]
+                                        - self.moe_ttt_lr * grads[grad_idx]
+                                    )
+                                    grad_idx += 1
 
                 # Combine logits and compute final loss
                 logits_post = torch.cat(all_logits, dim=1)

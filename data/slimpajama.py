@@ -1,8 +1,22 @@
 import torch
+from pathlib import Path
 from typing import List
 from torch.utils.data import Dataset, IterableDataset
 from tokenizers import Tokenizer
 from datasets import load_dataset
+
+# Local data directory for offline training
+LOCAL_DATA_DIR = Path(__file__).parent / "slimpajama-chunk1"
+
+
+def get_local_data_path(data_dir: str = None) -> Path:
+    """Check if local SlimPajama data exists and return the path."""
+    if data_dir:
+        # e.g., data_dir="train/chunk1" -> LOCAL_DATA_DIR/train/chunk1
+        local_path = LOCAL_DATA_DIR / data_dir
+    else:
+        local_path = LOCAL_DATA_DIR
+    return local_path if local_path.exists() else None
 
 
 class SlimPajamaDataset(IterableDataset):
@@ -22,14 +36,40 @@ class SlimPajamaDataset(IterableDataset):
         self.seq_length = seq_length
         self.split = split
 
-        # Load dataset with streaming to avoid downloading everything
-        # For chunk1 specifically, use data_dir parameter
-        self.dataset = load_dataset(
-            "cerebras/SlimPajama-627B",
-            split=split,
-            streaming=True,
-            data_dir=data_dir,  # e.g., "train/chunk1" for specific chunk
-        )
+        # Check for local data first (offline mode)
+        local_path = get_local_data_path(data_dir)
+        if local_path:
+            # Use local files for offline training (supports .jsonl.zst or .parquet)
+            jsonl_files = list(local_path.glob("*.jsonl.zst"))
+            parquet_files = list(local_path.glob("*.parquet"))
+
+            if jsonl_files:
+                print(f"Using local SlimPajama data from {local_path} ({len(jsonl_files)} jsonl.zst files)")
+                self.dataset = load_dataset(
+                    "json",
+                    data_files=[str(f) for f in sorted(jsonl_files)],
+                    split="train",
+                    streaming=True,
+                )
+            elif parquet_files:
+                print(f"Using local SlimPajama data from {local_path} ({len(parquet_files)} parquet files)")
+                self.dataset = load_dataset(
+                    "parquet",
+                    data_files=[str(f) for f in sorted(parquet_files)],
+                    split="train",
+                    streaming=True,
+                )
+            else:
+                raise ValueError(f"Local path exists but no data files found: {local_path}")
+        else:
+            # Fall back to streaming from HuggingFace
+            print("No local data found, streaming from HuggingFace...")
+            self.dataset = load_dataset(
+                "cerebras/SlimPajama-627B",
+                split=split,
+                streaming=True,
+                data_dir=data_dir,  # e.g., "train/chunk1" for specific chunk
+            )
 
         self.pad_id = tokenizer.token_to_id("<|pad|>")
         if self.pad_id is None:
@@ -77,13 +117,40 @@ class SlimPajamaMapDataset(Dataset):
         if self.pad_id is None:
             self.pad_id = tokenizer.token_to_id("<|endoftext|>")
 
-        # Load dataset with streaming
-        dataset = load_dataset(
-            "cerebras/SlimPajama-627B",
-            split=split,
-            streaming=True,
-            data_dir=data_dir,
-        )
+        # Check for local data first (offline mode)
+        # For validation, we use the same chunk1 data if no validation-specific local data exists
+        local_path = get_local_data_path(data_dir) if data_dir else get_local_data_path("train/chunk1")
+        if local_path:
+            jsonl_files = list(local_path.glob("*.jsonl.zst"))
+            parquet_files = list(local_path.glob("*.parquet"))
+
+            if jsonl_files:
+                print(f"Using local SlimPajama data for validation from {local_path}")
+                dataset = load_dataset(
+                    "json",
+                    data_files=[str(f) for f in sorted(jsonl_files)],
+                    split="train",
+                    streaming=True,
+                )
+            elif parquet_files:
+                print(f"Using local SlimPajama data for validation from {local_path}")
+                dataset = load_dataset(
+                    "parquet",
+                    data_files=[str(f) for f in sorted(parquet_files)],
+                    split="train",
+                    streaming=True,
+                )
+            else:
+                raise ValueError(f"Local path exists but no data files found: {local_path}")
+        else:
+            # Fall back to streaming from HuggingFace
+            print("No local data found, streaming from HuggingFace...")
+            dataset = load_dataset(
+                "cerebras/SlimPajama-627B",
+                split=split,
+                streaming=True,
+                data_dir=data_dir,
+            )
 
         buffer = []
         for example in dataset:
