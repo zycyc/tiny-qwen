@@ -41,10 +41,12 @@ class ModelConfig:
     # Ablation: disable attention (identity)
     disable_attention: bool = False
 
-    # TTT-E2E (Cortex): adapt gate weights at test time
+    # TTT-E2E (Cortex): adapt gate and/or neuron weights at test time
     cortex_use_ttt_e2e: bool = False
     cortex_ttt_lr: float = 1.0
     cortex_ttt_batch_size: int = 16
+    cortex_ttt_adapt_gate: bool = True  # Adapt gate network weights
+    cortex_ttt_adapt_neurons: bool = False  # Adapt SwiGLU neuron weights
 
     # TTT-E2E (Dense): adapt MLP weights at test time
     dense_use_ttt_e2e: bool = False
@@ -573,7 +575,7 @@ class CortexFeedForward(nn.Module):
         self.up_proj = nn.Linear(self.n_embed, self.hidden_size, bias=False)
         self.down_proj = nn.Linear(self.hidden_size, self.n_embed, bias=False)
 
-    def forward(self, x, gate_weight_override=None):
+    def forward(self, x, gate_weight_override=None, neuron_weight_overrides=None):
         # Compute mask logits from input
         if gate_weight_override is not None:
             if isinstance(gate_weight_override, tuple):
@@ -611,10 +613,18 @@ class CortexFeedForward(nn.Module):
         else:
             mask = self._hard_kwta(mask_logits)
 
-        # SwiGLU with mask
-        hidden = F.silu(self.gate_proj(x)) * self.up_proj(x)
-        hidden = hidden * mask
-        return self.down_proj(hidden)
+        # SwiGLU with mask (optionally use overridden weights)
+        if neuron_weight_overrides is not None:
+            gate_proj_w = neuron_weight_overrides["gate_proj"]
+            up_proj_w = neuron_weight_overrides["up_proj"]
+            down_proj_w = neuron_weight_overrides["down_proj"]
+            hidden = F.silu(F.linear(x, gate_proj_w)) * F.linear(x, up_proj_w)
+            hidden = hidden * mask
+            return F.linear(hidden, down_proj_w)
+        else:
+            hidden = F.silu(self.gate_proj(x)) * self.up_proj(x)
+            hidden = hidden * mask
+            return self.down_proj(hidden)
 
     def _soft_kwta(self, logits):
         """
@@ -748,7 +758,13 @@ class Qwen3MoeBlock(nn.Module):
             self.mlp = MLP(config)
 
     def forward(
-        self, x, cos, sin, gate_weight_override=None, expert_weight_overrides=None
+        self,
+        x,
+        cos,
+        sin,
+        gate_weight_override=None,
+        expert_weight_overrides=None,
+        neuron_weight_overrides=None,
     ):
         x = x + self.self_attn(self.input_layernorm(x), cos, sin)
         # Pass weight overrides to MLP (MoEFeedForward or CortexFeedForward)
@@ -758,13 +774,14 @@ class Qwen3MoeBlock(nn.Module):
                 gate_weight_override=gate_weight_override,
                 expert_weight_overrides=expert_weight_overrides,
             )
-        elif gate_weight_override is not None and isinstance(
-            self.mlp, CortexFeedForward
+        elif isinstance(self.mlp, CortexFeedForward) and (
+            gate_weight_override is not None or neuron_weight_overrides is not None
         ):
-            # CortexFeedForward path (supports both full and low-rank gates)
+            # CortexFeedForward path (supports gate and/or neuron overrides)
             x = x + self.mlp(
                 self.post_attention_layernorm(x),
                 gate_weight_override=gate_weight_override,
+                neuron_weight_overrides=neuron_weight_overrides,
             )
         else:
             x = x + self.mlp(self.post_attention_layernorm(x))
@@ -1033,11 +1050,13 @@ class Qwen3MoeModel(nn.Module):
         position_ids,
         gate_weight_overrides=None,
         expert_weight_overrides_by_layer=None,
+        neuron_weight_overrides_by_layer=None,
     ):
         """
         Args:
             gate_weight_overrides: dict {layer_idx: gate_weight_tensor}
             expert_weight_overrides_by_layer: dict {layer_idx: {expert_idx: {'gate_proj': w, ...}}}
+            neuron_weight_overrides_by_layer: dict {layer_idx: {'gate_proj': w, 'up_proj': w, 'down_proj': w}}
         """
         cos, sin = self.rotary_emb(x, position_ids)
         for i, layer in enumerate(self.layers):
@@ -1050,12 +1069,18 @@ class Qwen3MoeModel(nn.Module):
                 if expert_weight_overrides_by_layer
                 else None
             )
+            neuron_overrides = (
+                neuron_weight_overrides_by_layer.get(i)
+                if neuron_weight_overrides_by_layer
+                else None
+            )
             x = layer(
                 x,
                 cos,
                 sin,
                 gate_weight_override=gate_override,
                 expert_weight_overrides=expert_overrides,
+                neuron_weight_overrides=neuron_overrides,
             )
         x = self.norm(x)
         return x
@@ -1168,6 +1193,7 @@ class Qwen3MoE(nn.Module):
         position_ids: torch.Tensor = None,
         gate_weight_overrides=None,
         expert_weight_overrides_by_layer=None,
+        neuron_weight_overrides_by_layer=None,
     ) -> torch.Tensor:
         x = self.model.embed_tokens(input_ids)
         if position_ids is None:
@@ -1177,6 +1203,7 @@ class Qwen3MoE(nn.Module):
             position_ids=position_ids,
             gate_weight_overrides=gate_weight_overrides,
             expert_weight_overrides_by_layer=expert_weight_overrides_by_layer,
+            neuron_weight_overrides_by_layer=neuron_weight_overrides_by_layer,
         )
 
         if self.lm_head is None:

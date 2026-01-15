@@ -302,7 +302,7 @@ QWEN3_MOE_CONFIG = ModelConfig(
 
 # Cortex E2E: Meta-learning with inner/outer loop
 # Optimizes post-TTT loss with 2nd-order gradients (gradients through adaptation)
-QWEN3_CORTEX_E2E_CONFIG = ModelConfig(
+QWEN3_CORTEX_E2E_NEURON_CONFIG = ModelConfig(
     n_embed=384,
     n_heads=6,
     n_kv_heads=2,
@@ -317,17 +317,50 @@ QWEN3_CORTEX_E2E_CONFIG = ModelConfig(
     use_cortex=True,
     cortex_hidden_size=4957,
     cortex_k_ratio=4,
+    cortex_topk_softmax=True,
+    cortex_soft_kwta=False,
+    cortex_temperature=1.0,
+    cortex_low_rank_gate=True,  # False for normal gate, True for low-rank gate
+    cortex_gate_rank=64,  # 64 for low-rank gate
+    cortex_gate_norm=True,  # normalize gate logits to prevent scale drift
+    # TTT-E2E: sequential gate and/or neuron weight adaptation
+    cortex_use_ttt_e2e=True,
+    cortex_ttt_lr=1.0,
+    cortex_ttt_batch_size=16,
+    cortex_ttt_adapt_gate=False,
+    cortex_ttt_adapt_neurons=True,
+    disable_attention=True,
+)
+
+QWEN3_CORTEX_E2E_GATE_CONFIG = ModelConfig(
+    n_embed=384,
+    n_heads=6,
+    n_kv_heads=2,
+    n_layer=2,
+    n_mlp=1536,
+    vocab_size=151936,
+    rope_theta=1000000,
+    rms_norm_eps=1e-6,
+    tie_word_embeddings=False,
+    head_dim=64,
+    # Cortex parameters
+    use_cortex=True,
+    # to match total param of dense -- 1536*3/4 = 1152, or (3*1536-64) * 384 / (3*384+64) = 1435 when using lor gate
+    cortex_hidden_size=4957,  # 2633 for normal gate, 4957 for low-rank gate
+    cortex_k_ratio=4,
     cortex_topk_softmax=False,
     cortex_soft_kwta=True,
     cortex_temperature=1.0,
     cortex_low_rank_gate=True,  # False for normal gate, True for low-rank gate
     cortex_gate_rank=64,  # 64 for low-rank gate
     cortex_gate_norm=True,  # normalize gate logits to prevent scale drift
-    # TTT-E2E: sequential gate weight adaptation
+    # TTT-E2E: sequential gate and/or neuron weight adaptation
     cortex_use_ttt_e2e=True,
     cortex_ttt_lr=1.0,
     cortex_ttt_batch_size=16,
-    disable_attention=True,
+    cortex_ttt_adapt_gate=True,
+    cortex_ttt_adapt_neurons=False,
+    disable_attention=False,
 )
 
 # Dense TTT-E2E: Meta-learning with MLP weight adaptation
@@ -362,7 +395,7 @@ QWEN3_MOE_TTT_GATE_CONFIG = ModelConfig(
     rms_norm_eps=1e-6,
     tie_word_embeddings=False,
     head_dim=64,
-    disable_attention=True,
+    disable_attention=False,
     # MoE parameters
     num_experts=8,
     num_experts_per_tok=2,
@@ -387,7 +420,7 @@ QWEN3_MOE_TTT_EXPERT_CONFIG = ModelConfig(
     rms_norm_eps=1e-6,
     tie_word_embeddings=False,
     head_dim=64,
-    disable_attention=True,
+    disable_attention=False,
     # MoE parameters
     num_experts=8,
     num_experts_per_tok=2,
@@ -406,7 +439,8 @@ MODEL_CONFIGS = {
     "moe": ("moe", QWEN3_MOE_CONFIG),
     "moe-ttt-gate": ("moe", QWEN3_MOE_TTT_GATE_CONFIG),
     "moe-ttt-expert": ("moe", QWEN3_MOE_TTT_EXPERT_CONFIG),
-    "cortex-ttt": ("cortex", QWEN3_CORTEX_E2E_CONFIG),
+    "cortex-ttt-neuron": ("cortex", QWEN3_CORTEX_E2E_NEURON_CONFIG),
+    "cortex-ttt-gate": ("cortex", QWEN3_CORTEX_E2E_GATE_CONFIG),
 }
 
 # =============================================================================
@@ -460,11 +494,15 @@ class Qwen3ForContinualPretrain(L.LightningModule):
         # Current phase (for logging)
         self.current_phase = 1
 
-        # Cortex TTT-E2E (adapt gate weights at test time)
+        # Cortex TTT-E2E (adapt gate and/or neuron weights at test time)
         self.use_ttt_e2e = getattr(config, "cortex_use_ttt_e2e", False)
         if self.use_ttt_e2e:
             self.ttt_lr = config.cortex_ttt_lr
             self.ttt_batch_size = config.cortex_ttt_batch_size
+            self.cortex_ttt_adapt_gate = getattr(config, "cortex_ttt_adapt_gate", True)
+            self.cortex_ttt_adapt_neurons = getattr(
+                config, "cortex_ttt_adapt_neurons", False
+            )
 
         # Dense TTT-E2E (adapt MLP weights at test time)
         self.use_dense_ttt_e2e = getattr(config, "dense_use_ttt_e2e", False)
@@ -500,38 +538,56 @@ class Qwen3ForContinualPretrain(L.LightningModule):
         labels = batch["labels"]
 
         if self.use_ttt_e2e:
-            # Cortex TTT-E2E: Sequential mini-batch gate weight adaptation
-            # Process tokens in chunks, adapting gate weights after each chunk
-            # This allows loss to decrease with position even without attention
-
+            # Cortex TTT-E2E: Sequential mini-batch adaptation of gate and/or neuron weights
             batch_size, seq_len = input_ids.shape
-            chunk_size = self.ttt_batch_size  # 16 tokens per chunk
+            chunk_size = self.ttt_batch_size
 
-            # 1. Collect gate weights by layer index
-            gate_params = []
+            # 1. Collect parameters to adapt
+            gate_params = []  # (layer_idx, weight or (gate_down_w, gate_up_w))
+            neuron_params = []  # (layer_idx, {'gate_proj': w, 'up_proj': w, 'down_proj': w})
             is_low_rank = False
+
             for i, layer in enumerate(self.qwen_model.model.layers):
-                if hasattr(layer.mlp, "gate"):
-                    gate_params.append((i, layer.mlp.gate.weight))
-                elif getattr(layer.mlp, "low_rank_gate", False):
-                    is_low_rank = True
-                    gate_params.append(
-                        (i, (layer.mlp.gate_down.weight, layer.mlp.gate_up.weight))
+                if self.cortex_ttt_adapt_gate:
+                    if hasattr(layer.mlp, "gate"):
+                        gate_params.append((i, layer.mlp.gate.weight))
+                    elif getattr(layer.mlp, "low_rank_gate", False):
+                        is_low_rank = True
+                        gate_params.append(
+                            (i, (layer.mlp.gate_down.weight, layer.mlp.gate_up.weight))
+                        )
+
+                if self.cortex_ttt_adapt_neurons:
+                    neuron_params.append(
+                        (
+                            i,
+                            {
+                                "gate_proj": layer.mlp.gate_proj.weight,
+                                "up_proj": layer.mlp.up_proj.weight,
+                                "down_proj": layer.mlp.down_proj.weight,
+                            },
+                        )
                     )
 
-            # Initialize adapted weights as clones of original
-            current_weights = {}
+            # 2. Initialize adapted weights as clones
+            current_gate_weights = {}
             for layer_idx, weight in gate_params:
                 if is_low_rank:
                     gate_down_w, gate_up_w = weight
-                    current_weights[layer_idx] = (
+                    current_gate_weights[layer_idx] = (
                         gate_down_w.clone(),
                         gate_up_w.clone(),
                     )
                 else:
-                    current_weights[layer_idx] = weight.clone()
+                    current_gate_weights[layer_idx] = weight.clone()
 
-            # 2. Process sequence in chunks, adapting after each
+            current_neuron_weights = {}  # {layer_idx: {'gate_proj': w, ...}}
+            for layer_idx, param_dict in neuron_params:
+                current_neuron_weights[layer_idx] = {
+                    key: param.clone() for key, param in param_dict.items()
+                }
+
+            # 3. Process sequence in chunks
             all_logits = []
             total_loss = 0.0
             num_chunks = (seq_len + chunk_size - 1) // chunk_size
@@ -540,81 +596,101 @@ class Qwen3ForContinualPretrain(L.LightningModule):
                 start = chunk_idx * chunk_size
                 end = min(start + chunk_size, seq_len)
 
-                # Get chunk inputs/labels
                 chunk_input = input_ids[:, start:end]
                 chunk_labels = labels[:, start:end]
 
-                # Create correct position IDs for this chunk
-                chunk_position_ids = torch.arange(
-                    start, end, device=input_ids.device, dtype=torch.long
-                )
-                chunk_position_ids = chunk_position_ids.unsqueeze(0).expand(
-                    batch_size, -1
+                # Position IDs for this chunk
+                chunk_position_ids = (
+                    torch.arange(start, end, device=input_ids.device, dtype=torch.long)
+                    .unsqueeze(0)
+                    .expand(batch_size, -1)
                 )
 
-                # Forward with current adapted weights and correct position IDs
+                # Forward with adapted weights
                 logits_chunk = self.qwen_model(
                     chunk_input,
                     position_ids=chunk_position_ids,
-                    gate_weight_overrides=current_weights,
+                    gate_weight_overrides=current_gate_weights
+                    if self.cortex_ttt_adapt_gate
+                    else None,
+                    neuron_weight_overrides_by_layer=current_neuron_weights
+                    if self.cortex_ttt_adapt_neurons
+                    else None,
                 )
                 all_logits.append(logits_chunk)
 
-                # Compute loss for this chunk
+                # Compute chunk loss
                 chunk_loss = self.loss_fct(
                     logits_chunk.reshape(-1, logits_chunk.size(-1)),
                     chunk_labels.reshape(-1),
                 )
                 total_loss = total_loss + chunk_loss * (end - start)
 
-                # Adapt weights based on this chunk's loss (except for last chunk)
+                # Adapt weights (except for last chunk)
                 if chunk_idx < num_chunks - 1:
-                    if is_low_rank:
-                        # Collect all low-rank parameters (gate_down and gate_up for each layer)
-                        all_params = []
-                        for i, _ in gate_params:
+                    # Collect all params for gradient computation
+                    all_params = []
+                    if self.cortex_ttt_adapt_gate:
+                        if is_low_rank:
+                            for i, _ in gate_params:
+                                all_params.extend(
+                                    [
+                                        current_gate_weights[i][0],
+                                        current_gate_weights[i][1],
+                                    ]
+                                )
+                        else:
                             all_params.extend(
-                                [current_weights[i][0], current_weights[i][1]]
+                                [current_gate_weights[i] for i, _ in gate_params]
                             )
+                    if self.cortex_ttt_adapt_neurons:
+                        for layer_idx, _ in neuron_params:
+                            for key in ["gate_proj", "up_proj", "down_proj"]:
+                                all_params.append(
+                                    current_neuron_weights[layer_idx][key]
+                                )
 
-                        # Compute gradients with graph tracking
-                        grads = torch.autograd.grad(
-                            chunk_loss,
-                            all_params,
-                            create_graph=True,
-                            retain_graph=True,
-                        )
+                    # Compute gradients
+                    grads = torch.autograd.grad(
+                        chunk_loss,
+                        all_params,
+                        create_graph=True,
+                        retain_graph=True,
+                    )
 
-                        # Update both gate_down and gate_up for each layer
-                        grad_idx = 0
-                        for layer_idx, _ in gate_params:
-                            gd_grad, gu_grad = grads[grad_idx], grads[grad_idx + 1]
-                            current_weights[layer_idx] = (
-                                current_weights[layer_idx][0] - self.ttt_lr * gd_grad,
-                                current_weights[layer_idx][1] - self.ttt_lr * gu_grad,
-                            )
-                            grad_idx += 2
-                    else:
-                        # Flatten current weights for gradient computation
-                        all_params = [current_weights[i] for i, _ in gate_params]
+                    # Update weights
+                    grad_idx = 0
+                    if self.cortex_ttt_adapt_gate:
+                        if is_low_rank:
+                            for layer_idx, _ in gate_params:
+                                gd_grad, gu_grad = grads[grad_idx], grads[grad_idx + 1]
+                                current_gate_weights[layer_idx] = (
+                                    current_gate_weights[layer_idx][0]
+                                    - self.ttt_lr * gd_grad,
+                                    current_gate_weights[layer_idx][1]
+                                    - self.ttt_lr * gu_grad,
+                                )
+                                grad_idx += 2
+                        else:
+                            for layer_idx, _ in gate_params:
+                                current_gate_weights[layer_idx] = (
+                                    current_gate_weights[layer_idx]
+                                    - self.ttt_lr * grads[grad_idx]
+                                )
+                                grad_idx += 1
 
-                        # Compute gradients with graph tracking
-                        grads = torch.autograd.grad(
-                            chunk_loss,
-                            all_params,
-                            create_graph=True,
-                            retain_graph=True,
-                        )
+                    if self.cortex_ttt_adapt_neurons:
+                        for layer_idx, _ in neuron_params:
+                            for key in ["gate_proj", "up_proj", "down_proj"]:
+                                current_neuron_weights[layer_idx][key] = (
+                                    current_neuron_weights[layer_idx][key]
+                                    - self.ttt_lr * grads[grad_idx]
+                                )
+                                grad_idx += 1
 
-                        # Update adapted weights
-                        for (layer_idx, _), grad in zip(gate_params, grads):
-                            current_weights[layer_idx] = (
-                                current_weights[layer_idx] - self.ttt_lr * grad
-                            )
-
-            # Combine all chunk logits
+            # 4. Combine logits and compute final loss
             logits_post = torch.cat(all_logits, dim=1)
-            loss_post = total_loss / seq_len  # Normalize by sequence length
+            loss_post = total_loss / seq_len
 
             self.log(
                 "train_loss", loss_post, prog_bar=True, on_step=True, on_epoch=False
@@ -622,7 +698,7 @@ class Qwen3ForContinualPretrain(L.LightningModule):
             self.log("phase", float(self.current_phase), on_step=True, on_epoch=False)
             self.train_losses.append(loss_post.detach().cpu())
 
-            # Log per-position loss every 100 steps
+            # Log per-position loss periodically
             if self.global_step % 100 == 0:
                 per_pos_loss = self.compute_per_position_loss(logits_post, labels)
                 seq_len = per_pos_loss.size(0)
@@ -948,7 +1024,7 @@ class Qwen3ForContinualPretrain(L.LightningModule):
         labels = batch["labels"]
 
         if self.use_ttt_e2e:
-            # Cortex TTT-E2E: Sequential mini-batch gate weight adaptation
+            # Cortex TTT-E2E: Sequential mini-batch adaptation of gate and/or neuron weights
             with torch.inference_mode(False), torch.enable_grad():
                 input_ids = input_ids.clone()
                 labels = labels.clone()
@@ -956,29 +1032,56 @@ class Qwen3ForContinualPretrain(L.LightningModule):
                 batch_size, seq_len = input_ids.shape
                 chunk_size = self.ttt_batch_size
 
-                # Collect gate weights by layer
+                # Collect parameters to adapt
                 gate_params = []
+                neuron_params = []
                 is_low_rank = False
+
                 for i, layer in enumerate(self.qwen_model.model.layers):
-                    if hasattr(layer.mlp, "gate"):
-                        gate_params.append((i, layer.mlp.gate.weight))
-                    elif getattr(layer.mlp, "low_rank_gate", False):
-                        is_low_rank = True
-                        gate_params.append(
-                            (i, (layer.mlp.gate_down.weight, layer.mlp.gate_up.weight))
+                    if self.cortex_ttt_adapt_gate:
+                        if hasattr(layer.mlp, "gate"):
+                            gate_params.append((i, layer.mlp.gate.weight))
+                        elif getattr(layer.mlp, "low_rank_gate", False):
+                            is_low_rank = True
+                            gate_params.append(
+                                (
+                                    i,
+                                    (
+                                        layer.mlp.gate_down.weight,
+                                        layer.mlp.gate_up.weight,
+                                    ),
+                                )
+                            )
+
+                    if self.cortex_ttt_adapt_neurons:
+                        neuron_params.append(
+                            (
+                                i,
+                                {
+                                    "gate_proj": layer.mlp.gate_proj.weight,
+                                    "up_proj": layer.mlp.up_proj.weight,
+                                    "down_proj": layer.mlp.down_proj.weight,
+                                },
+                            )
                         )
 
-                # Initialize adapted weights as clones of original
-                current_weights = {}
+                # Initialize adapted weights as clones
+                current_gate_weights = {}
                 for layer_idx, weight in gate_params:
                     if is_low_rank:
                         gate_down_w, gate_up_w = weight
-                        current_weights[layer_idx] = (
+                        current_gate_weights[layer_idx] = (
                             gate_down_w.clone(),
                             gate_up_w.clone(),
                         )
                     else:
-                        current_weights[layer_idx] = weight.clone()
+                        current_gate_weights[layer_idx] = weight.clone()
+
+                current_neuron_weights = {}
+                for layer_idx, param_dict in neuron_params:
+                    current_neuron_weights[layer_idx] = {
+                        key: param.clone() for key, param in param_dict.items()
+                    }
 
                 # Process sequence in chunks
                 all_logits = []
@@ -991,19 +1094,23 @@ class Qwen3ForContinualPretrain(L.LightningModule):
                     chunk_input = input_ids[:, start:end]
                     chunk_labels = labels[:, start:end]
 
-                    # Correct position IDs for this chunk
-                    chunk_position_ids = torch.arange(
-                        start, end, device=input_ids.device, dtype=torch.long
-                    )
-                    chunk_position_ids = chunk_position_ids.unsqueeze(0).expand(
-                        batch_size, -1
+                    chunk_position_ids = (
+                        torch.arange(
+                            start, end, device=input_ids.device, dtype=torch.long
+                        )
+                        .unsqueeze(0)
+                        .expand(batch_size, -1)
                     )
 
-                    # Forward with adapted weights
                     logits_chunk = self.qwen_model(
                         chunk_input,
                         position_ids=chunk_position_ids,
-                        gate_weight_overrides=current_weights,
+                        gate_weight_overrides=current_gate_weights
+                        if self.cortex_ttt_adapt_gate
+                        else None,
+                        neuron_weight_overrides_by_layer=current_neuron_weights
+                        if self.cortex_ttt_adapt_neurons
+                        else None,
                     )
                     all_logits.append(logits_chunk)
 
@@ -1014,41 +1121,64 @@ class Qwen3ForContinualPretrain(L.LightningModule):
                             chunk_labels.reshape(-1),
                         )
 
-                        if is_low_rank:
-                            # Collect all low-rank parameters
-                            all_params = []
-                            for i, _ in gate_params:
+                        # Collect all params for gradient computation
+                        all_params = []
+                        if self.cortex_ttt_adapt_gate:
+                            if is_low_rank:
+                                for i, _ in gate_params:
+                                    all_params.extend(
+                                        [
+                                            current_gate_weights[i][0],
+                                            current_gate_weights[i][1],
+                                        ]
+                                    )
+                            else:
                                 all_params.extend(
-                                    [current_weights[i][0], current_weights[i][1]]
+                                    [current_gate_weights[i] for i, _ in gate_params]
                                 )
+                        if self.cortex_ttt_adapt_neurons:
+                            for layer_idx, _ in neuron_params:
+                                for key in ["gate_proj", "up_proj", "down_proj"]:
+                                    all_params.append(
+                                        current_neuron_weights[layer_idx][key]
+                                    )
 
-                            grads = torch.autograd.grad(
-                                chunk_loss, all_params, retain_graph=False
-                            )
+                        grads = torch.autograd.grad(
+                            chunk_loss, all_params, retain_graph=False
+                        )
 
-                            # Update both gate_down and gate_up for each layer
-                            grad_idx = 0
-                            for layer_idx, _ in gate_params:
-                                gd_grad, gu_grad = grads[grad_idx], grads[grad_idx + 1]
-                                current_weights[layer_idx] = (
-                                    current_weights[layer_idx][0]
-                                    - self.ttt_lr * gd_grad,
-                                    current_weights[layer_idx][1]
-                                    - self.ttt_lr * gu_grad,
-                                )
-                                grad_idx += 2
-                        else:
-                            all_params = [current_weights[i] for i, _ in gate_params]
+                        # Update weights
+                        grad_idx = 0
+                        if self.cortex_ttt_adapt_gate:
+                            if is_low_rank:
+                                for layer_idx, _ in gate_params:
+                                    gd_grad, gu_grad = (
+                                        grads[grad_idx],
+                                        grads[grad_idx + 1],
+                                    )
+                                    current_gate_weights[layer_idx] = (
+                                        current_gate_weights[layer_idx][0]
+                                        - self.ttt_lr * gd_grad,
+                                        current_gate_weights[layer_idx][1]
+                                        - self.ttt_lr * gu_grad,
+                                    )
+                                    grad_idx += 2
+                            else:
+                                for layer_idx, _ in gate_params:
+                                    current_gate_weights[layer_idx] = (
+                                        current_gate_weights[layer_idx]
+                                        - self.ttt_lr * grads[grad_idx]
+                                    )
+                                    grad_idx += 1
 
-                            grads = torch.autograd.grad(
-                                chunk_loss, all_params, retain_graph=False
-                            )
-
-                            # Update adapted weights (no graph needed for validation)
-                            for (layer_idx, _), grad in zip(gate_params, grads):
-                                current_weights[layer_idx] = (
-                                    current_weights[layer_idx] - self.ttt_lr * grad
-                                )
+                        if self.cortex_ttt_adapt_neurons:
+                            for layer_idx, _ in neuron_params:
+                                for key in ["gate_proj", "up_proj", "down_proj"]:
+                                    current_neuron_weights[layer_idx][key] = (
+                                        current_neuron_weights[layer_idx][key]
+                                        - self.ttt_lr * grads[grad_idx]
+                                    )
+                                    grad_idx += 1
 
                 # Combine logits and compute final loss
                 logits_post = torch.cat(all_logits, dim=1)
@@ -1551,7 +1681,7 @@ if __name__ == "__main__":
     # Disable Flash Attention for E2E mode (2nd-order gradients not supported)
     if getattr(config, "cortex_use_ttt_e2e", False) or getattr(
         config, "dense_use_ttt_e2e", False
-    ):
+    ) or getattr(config, "moe_use_ttt_e2e", False):
         print("\nDisabling Flash/Memory-efficient attention for 2nd-order gradients...")
         torch.backends.cuda.enable_flash_sdp(False)
         torch.backends.cuda.enable_mem_efficient_sdp(False)
@@ -1579,7 +1709,9 @@ if __name__ == "__main__":
         )
         if getattr(config, "cortex_use_ttt_e2e", False):
             print("Cortex TTT-E2E: ENABLED")
-            print("  Adapts gate weights at test time (sequential mini-batch)")
+            adapt_gate = getattr(config, "cortex_ttt_adapt_gate", True)
+            adapt_neurons = getattr(config, "cortex_ttt_adapt_neurons", False)
+            print(f"  Adapt gate: {adapt_gate}, Adapt neurons: {adapt_neurons}")
             print(f"  TTT learning rate: {config.cortex_ttt_lr}")
             print(f"  TTT batch size: {config.cortex_ttt_batch_size} tokens")
 
@@ -1663,7 +1795,7 @@ if __name__ == "__main__":
 
     wandb_logger = WandbLogger(
         project=args.wandb_project,
-        name=f"{model_name}-continual-{timestamp}",
+        name=f"{model_name}-{timestamp}",
         save_dir="cache/wandb",
         log_model=False,
         config={
@@ -1695,6 +1827,12 @@ if __name__ == "__main__":
                     "cortex_ttt_lr": getattr(config, "cortex_ttt_lr", None),
                     "cortex_ttt_batch_size": getattr(
                         config, "cortex_ttt_batch_size", None
+                    ),
+                    "cortex_ttt_adapt_gate": getattr(
+                        config, "cortex_ttt_adapt_gate", True
+                    ),
+                    "cortex_ttt_adapt_neurons": getattr(
+                        config, "cortex_ttt_adapt_neurons", False
                     ),
                 }
                 if model_type == "cortex"
